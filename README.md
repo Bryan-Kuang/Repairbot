@@ -34,7 +34,7 @@ pip install -e .
 cp config.example.json config.json
 ```
 
-编辑 `config.json` 中的 `guild_id`、`listen_channel_id`、`report_channel_id` 和 `repository`。在 Discord 用户设置中打开开发者模式后，可以右键复制服务器和频道 ID。仓库可填 `owner/repo` 或 `https://github.com/owner/repo`。
+编辑 `config.json` 中的 `guild_id`、`listen_channel_id`、`report_channel_id`、`repository` 和 `allowed_author_ids`（发报错的日志 Bot / webhook / 用户 ID）。在 Discord 用户设置中打开开发者模式后，可以右键复制服务器和频道 ID。仓库可填 `owner/repo` 或 `https://github.com/owner/repo`。
 
 在 Discord Developer Portal 创建 Bot，开启 **Message Content Intent**，邀请到服务器，并授予：监听频道的查看频道、读取消息历史权限；报告频道的查看频道、发送消息权限。使用 Bot Token，而非个人用户 Token。两个频道必须不同，并属于配置的服务器。
 
@@ -56,7 +56,7 @@ export DISCORD_TOKEN
 repairbot run --config config.json
 ```
 
-这一步启动真实监听和自动提交/合并。首次启动默认检查最近 50 条历史消息；若只想处理启动后的新消息，设 `startup_scan_messages` 为 `0`。后续断线/重启通过已持久化的频道水位补读漏掉的消息。Bot/webhook 报错也会处理；自己的消息会忽略。
+这一步启动真实监听和自动提交/合并。任务 worker 意外崩溃时服务会以非零状态退出，建议用 systemd 等进程管理器自动重启。首次启动默认检查最近 50 条历史消息；若只想处理启动后的新消息，设 `startup_scan_messages` 为 `0`。后续断线/重启通过已持久化的频道水位补读漏掉的消息。Bot/webhook 报错也会处理；自己的消息会忽略。
 
 ## 额度选择和续接
 
@@ -109,7 +109,7 @@ repairbot run --config config.json
 
 ## 配置与维护
 
-`allowed_author_ids` 可限定可信的用户、日志 Bot 或 webhook 作者 ID。空数组接受频道里所有作者。默认 `error_pattern` 匹配 error / exception / traceback / fatal / panic / 报错 / 错误；若日志格式不同，可更改正则或使用 `(?s).+` 处理所有非空文本。会读取消息文本和 embed 标题、描述、字段；不下载附件，也不执行报错消息中的指令。单条报错最多读取 `max_message_chars` 个字符，默认 24000。
+`allowed_author_ids` 限定可信的用户、日志 Bot 或 webhook 作者 ID，可写数字或数字字符串。`auto_merge=true` 时必须非空，否则启动报错，避免任何频道成员都能触发自动合并；空数组仅在 `auto_merge=false` 时允许，此时接受频道里所有作者。`auto_merge`、`require_ci` 必须为 JSON 布尔值，不接受字符串 `"false"`。默认 `error_pattern` 匹配 error / exception / traceback / fatal / panic / 报错 / 错误；若日志格式不同，可更改正则或使用 `(?s).+` 处理所有非空文本。会读取消息文本和 embed 标题、描述、字段；不下载附件，也不执行报错消息中的指令。单条报错最多读取 `max_message_chars` 个字符，默认 24000。
 
 ```bash
 repairbot jobs --config config.json
@@ -117,7 +117,7 @@ repairbot retry 123456789012345678 --config config.json
 python3 -m unittest discover -s tests -v
 ```
 
-`retry` 只重新排队 `failed` / `waiting` 任务，保留已完成阶段。CI 暂时失败、工具恢复或测试环境修复后可重试。若已人工改变 PR 提交，原 SHA 的审查不再有效；请人工处理该 PR，或发新报错启动新任务，不要修改数据库绕过版本检查。
+`retry` 只重新排队 `failed` / `waiting` 任务，保留已完成阶段，并重新开始 24 小时 CI 等待计时。CI 暂时失败、工具恢复或测试环境修复后可重试。若已人工改变 PR 提交，原 SHA 的审查不再有效；请人工处理该 PR，或发新报错启动新任务，不要修改数据库绕过版本检查。
 
 任务目录包含修复克隆、各审查克隆、会话日志、测试日志和进度文件；`state.sqlite3` 保存任务阶段与额度冷却，`service.log` 保存服务日志。默认不自动清理，避免误删未完成工作；长期运行时按需归档已结束任务。Discord 报告发送失败会短暂重试并保留本地日志，不会因此撤销已完成的合并。
 

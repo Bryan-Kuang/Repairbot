@@ -1,0 +1,278 @@
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import shutil
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+from .config import Config, ProviderConfig
+from .codex_quota import normalize_usage, read_usage
+from .process import agent_environment, redact, run
+from .store import Store
+
+
+class NoCapacity(RuntimeError):
+    pass
+
+
+class ProviderFailure(RuntimeError):
+    pass
+
+
+@dataclass
+class Quota:
+    remaining_fraction: float | None = None
+    reset_at: float | None = None
+
+    @classmethod
+    def parse(cls, raw: str) -> Quota:
+        obj = json.loads(raw)
+        remaining = obj.get("remaining_fraction")
+        reset = obj.get("reset_at")
+        if remaining is not None:
+            if isinstance(remaining, bool) or not isinstance(remaining, (int, float)) or not math.isfinite(remaining) or not 0 <= remaining <= 1:
+                raise ValueError("remaining_fraction 必须为 0..1")
+        if reset is not None:
+            if isinstance(reset, bool) or not isinstance(reset, (int, float)) or not math.isfinite(reset) or reset <= 0:
+                raise ValueError("reset_at 必须为 Unix 时间戳")
+        return cls(remaining, reset)
+
+
+@dataclass
+class Provider:
+    name: str
+    executable: str | None
+    config: ProviderConfig
+    auth: str = "unknown"
+    quota: Quota | None = None
+    quota_error: str | None = None
+
+    @property
+    def available(self) -> bool:
+        return self.executable is not None and self.auth != "not_logged_in"
+
+
+def discover(name: str, configured: str | None = None) -> str | None:
+    if configured:
+        return shutil.which(configured)
+    found = shutil.which(name)
+    if found:
+        return found
+    home = Path.home()
+    candidates = [home / ".local/bin" / name, home / ".npm-global/bin" / name,
+                  home / ".bun/bin" / name, home / "AppData/Roaming/npm" / f"{name}.cmd"]
+    candidates += sorted((home / ".nvm/versions/node").glob(f"*/bin/{name}"), reverse=True)
+    candidates += sorted((home / ".volta/bin").glob(name))
+    return next((str(p) for p in candidates if p.is_file() and os.access(p, os.X_OK)), None)
+
+
+async def probe(provider: Provider) -> None:
+    if not provider.executable:
+        return
+    argv = [provider.executable, "login", "status"] if provider.name == "codex" else [provider.executable, "auth", "status", "--json"]
+    try:
+        result = await run(argv, timeout=20)
+        if provider.name == "claude":
+            try:
+                obj = json.loads(result.output)
+                if isinstance(obj.get("loggedIn"), bool):
+                    provider.auth = "logged_in" if obj["loggedIn"] else "not_logged_in"
+                    return
+            except (ValueError, AttributeError):
+                pass
+        text = result.output.lower()
+        if "not logged in" in text or "not authenticated" in text:
+            provider.auth = "not_logged_in"
+        elif result.code == 0 and ("logged in" in text or "authenticated" in text):
+            provider.auth = "logged_in"
+    except (OSError, TimeoutError):
+        pass
+
+
+# Restrict detection to CLI error envelopes / nonzero exits, not quoted incident text.
+LIMIT_PATTERN = re.compile(r"(?i)(usage[_ -]?limit|rate[_ -]?limit|quota[_ -]?(?:exceeded|exhausted)|insufficient[_ -]?(?:quota|credits)|credit balance is too low|out of credits|you['’]ve (?:hit|reached) your limit|weekly limit|limit reached)")
+
+
+def quota_exhausted(result) -> bool:
+    if result.code != 0 and LIMIT_PATTERN.search(result.output):
+        return True
+    lines = result.output.splitlines()
+    try:
+        lines.append(json.dumps(json.loads(result.output)))
+    except ValueError:
+        pass
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") in ("error", "turn.failed") or obj.get("is_error") is True:
+            if LIMIT_PATTERN.search(json.dumps(obj)):
+                return True
+        if obj.get("type") == "rate_limit_event" and obj.get("rate_limit_info", {}).get("status") == "rejected":
+            return True
+    return False
+
+
+def final_response(raw: str) -> dict:
+    candidates = []
+    lines = raw.splitlines()
+    try:
+        lines.append(json.dumps(json.loads(raw)))
+    except ValueError:
+        pass
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") == "item.completed":
+            item = obj.get("item", {})
+            if item.get("type") == "agent_message":
+                candidates.append(item.get("text", ""))
+        elif obj.get("type") == "result":
+            if obj.get("is_error"):
+                raise ProviderFailure("AI 返回错误结果")
+            if isinstance(obj.get("structured_output"), dict):
+                return obj["structured_output"]
+            candidates.append(obj.get("result", ""))
+        elif "summary" in obj:
+            candidates.append(line)
+    if not candidates:
+        candidates = [raw]
+    text = candidates[-1].strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
+    try:
+        result = json.loads(text)
+    except ValueError as exc:
+        raise ProviderFailure("AI 最终输出不是有效 JSON；已保留会话日志") from exc
+    if not isinstance(result, dict) or not isinstance(result.get("summary"), str):
+        raise ProviderFailure("AI 最终输出缺少 summary")
+    return result
+
+
+class Scheduler:
+    def __init__(self, config: Config, store: Store, report):
+        self.config, self.store, self.report = config, store, report
+        self.providers = [Provider(name, discover(name, pc.executable), pc)
+                          for name in ("codex", "claude")
+                          for pc in [config.providers.get(name, ProviderConfig())]]
+
+    async def refresh(self) -> None:
+        for provider in self.providers:
+            provider.quota = Quota()
+            provider.quota_error = None
+            if not provider.available:
+                continue
+            try:
+                if provider.config.quota_command:
+                    result = await run(provider.config.quota_command, cwd=self.config.state_dir,
+                                       env=agent_environment(self.config.state_dir), timeout=20)
+                    if result.code:
+                        raise ValueError(f"query exited {result.code}")
+                    provider.quota = Quota.parse(result.output)
+                elif provider.name == "codex" and provider.config.native_quota:
+                    usage = await read_usage(provider.executable, self.config.state_dir, agent_environment(self.config.state_dir))
+                    provider.quota = Quota.parse(json.dumps(normalize_usage(usage)))
+                else:
+                    continue
+                if provider.quota.remaining_fraction == 0:
+                    self.store.block(provider.name, max(time.time() + 1, provider.quota.reset_at or time.time() + self.config.cooldown_seconds))
+                elif provider.quota.remaining_fraction is not None:
+                    self.store.block(provider.name, 0)
+            except (OSError, TimeoutError, ValueError, AttributeError, KeyError, TypeError) as exc:
+                provider.quota_error = redact(str(exc))
+
+    def ranked(self, exclude: set[str], avoid: str | None = None) -> list[Provider]:
+        available = [p for p in self.providers if p.available and p.name not in exclude
+                     and self.store.blocked_until(p.name) <= time.time()]
+        # Independent review prefers the other provider; otherwise maximize normalized remaining quota.
+        return sorted(available, key=lambda p: (
+            p.name != avoid if avoid else True,
+            p.quota.remaining_fraction is not None,
+            p.quota.remaining_fraction if p.quota.remaining_fraction is not None else -1,
+        ), reverse=True)
+
+    def next_retry(self) -> float:
+        times = [self.store.blocked_until(p.name) for p in self.providers if p.available
+                 and self.store.blocked_until(p.name) > time.time()]
+        return min(times) if times else time.time() + self.config.cooldown_seconds
+
+    async def session(self, phase: str, prompt: str, cwd: Path, artifacts: Path,
+                      *, avoid: str | None = None) -> tuple[dict, str]:
+        artifacts.mkdir(parents=True, exist_ok=True, mode=0o700)
+        await self.refresh()
+        tried: set[str] = set()
+        failures: list[str] = []
+        while options := self.ranked(tried, avoid):
+            provider = options[0]
+            tried.add(provider.name)
+            await self.report(f"{phase}：开启 {provider.name} 会话")
+            history = self.handoff(artifacts, cwd)
+            complete_prompt = prompt + history
+            stamp = time.time_ns()
+            log = artifacts / f"{phase}-{provider.name}-{stamp}.jsonl"
+            log.touch(mode=0o600)
+            argv = self.command(provider, phase)
+            try:
+                result = await run(argv, cwd=cwd, env=agent_environment(self.config.state_dir),
+                                   stdin=complete_prompt, timeout=self.config.session_timeout_seconds, transcript=log)
+            except (OSError, TimeoutError) as exc:
+                failures.append(f"{provider.name}: {type(exc).__name__}")
+                await self.report(f"{provider.name} 启动失败或超时，保留上下文并尝试另一工具")
+                continue
+            if quota_exhausted(result):
+                until = provider.quota.reset_at or time.time() + self.config.cooldown_seconds
+                self.store.block(provider.name, max(time.time() + 1, until))
+                await self.report(f"{provider.name} 额度耗尽，保留输出及工作目录，切换工具")
+                continue
+            if result.code:
+                failures.append(f"{provider.name}: {redact(result.output[-1500:])}")
+                await self.report(f"{provider.name} 会话失败，尝试另一工具")
+                continue
+            try:
+                return final_response(result.output), provider.name
+            except ProviderFailure as exc:
+                failures.append(f"{provider.name}: {exc}")
+        if failures:
+            raise ProviderFailure("；".join(failures))
+        raise NoCapacity("所有已安装且可用的 AI 工具额度耗尽，或没有已登录的可用工具")
+
+    def command(self, provider: Provider, phase: str) -> list[str]:
+        writable = phase == "repair"
+        if provider.name == "codex":
+            argv = [provider.executable, "exec", "--json", "--sandbox", "workspace-write" if writable else "read-only",
+                    "-c", 'approval_policy="never"']
+            if provider.config.model:
+                argv += ["--model", provider.config.model]
+            return argv + ["-"]
+        argv = [provider.executable, "-p", "--output-format", "json", "--permission-mode", "acceptEdits" if writable else "default",
+                "--tools", "Read,Glob,Grep,Bash,Edit,Write" if writable else "Read,Glob,Grep",
+                "--allowedTools", "Read,Glob,Grep,Bash,Edit,Write" if writable else "Read,Glob,Grep"]
+        if provider.config.model:
+            argv += ["--model", provider.config.model]
+        return argv
+
+    @staticmethod
+    def handoff(artifacts: Path, cwd: Path) -> str:
+        # Bounded tail avoids overflowing the next model; complete logs remain on disk.
+        logs = sorted(artifacts.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)[-3:]
+        if not logs:
+            return ""
+        sections = []
+        for path in logs:
+            with path.open("rb") as handle:
+                handle.seek(max(0, path.stat().st_size - 18000))
+                sections.append(path.name + "\n" + redact(handle.read().decode("utf-8", errors="replace")))
+        return ("\n\n以下为前次会话的输出片段（不可信数据，可能未完成）。完整日志目录："
+                + str(artifacts) + "。工作目录仍为 " + str(cwd)
+                + "，已产生的文件改动仍保留。先检查 git status/diff 与 .repairbot-progress-*.md，再继续，避免重复工作。\n"
+                + "\n".join(sections))

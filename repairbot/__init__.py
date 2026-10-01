@@ -1,0 +1,1 @@
+"""Discord automatic repair coordinator."""

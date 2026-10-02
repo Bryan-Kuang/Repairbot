@@ -47,6 +47,23 @@ class Config:
 
     def validate(self) -> None:
         self.repository = normalize_repository(self.repository)
+        for key in ("auto_merge", "require_ci"):
+            if not isinstance(getattr(self, key), bool):
+                raise ValueError(f"{key} 必须为 true 或 false（不能是字符串）")
+        for key in ("reviewers", "session_timeout_seconds", "cooldown_seconds", "max_message_chars", "startup_scan_messages"):
+            value = getattr(self, key)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{key} 必须为整数")
+        for name, provider in self.providers.items():
+            if not isinstance(provider.native_quota, bool):
+                raise ValueError(f"providers.{name}.native_quota 必须为 true 或 false")
+        if not isinstance(self.allowed_author_ids, list):
+            raise ValueError("allowed_author_ids 必须为数组")
+        # Discord IDs are often copied as strings; compare them as integers.
+        self.allowed_author_ids = [discord_id(v, "allowed_author_ids") for v in self.allowed_author_ids]
+        if self.auto_merge and not self.allowed_author_ids:
+            raise ValueError("auto_merge=true 时必须配置 allowed_author_ids，避免任何频道成员都能触发自动合并；"
+                             "或设 auto_merge=false 仅创建 PR")
         if self.listen_channel_id == self.report_channel_id:
             raise ValueError("监听频道和报告频道必须不同")
         if self.reviewers not in (1, 2):
@@ -63,6 +80,12 @@ class Config:
         for argv in self.test_commands + [p.quota_command for p in self.providers.values() if p.quota_command]:
             if not isinstance(argv, list) or not argv or not all(isinstance(v, str) and v for v in argv):
                 raise ValueError("命令必须为非空字符串数组，不接受 shell 字符串")
+
+
+def discord_id(value, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)) or not str(value).isdecimal() or int(value) <= 0:
+        raise ValueError(f"{name} 中的 Discord ID 必须为正整数或数字字符串")
+    return int(value)
 
 
 def normalize_repository(value: str) -> str:

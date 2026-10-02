@@ -49,6 +49,11 @@ class ParsingTests(unittest.TestCase):
         self.assertTrue(quota_exhausted(Result(0, json.dumps({"type": "result", "is_error": True,
                                                             "result": "Credit balance is too low"}, indent=2))))
         self.assertTrue(quota_exhausted(Result(0, '{"type":"turn.failed","error":{"message":"insufficient_quota"}}')))
+        command = json.dumps({"type": "item.completed", "item": {"type": "command_execution",
+                                                                  "aggregated_output": "raise RateLimitError('rate limit')"}})
+        self.assertFalse(quota_exhausted(Result(1, command)))
+        self.assertFalse(quota_exhausted(Result(1, json.dumps({"type": "result", "is_error": False,
+                                                               "result": "fixed the rate_limit handler"}, indent=2))))
 
     def test_quota_validation(self):
         self.assertEqual(Quota.parse('{"remaining_fraction":0.75}').remaining_fraction, .75)
@@ -76,6 +81,20 @@ class ParsingTests(unittest.TestCase):
         c.report_channel_id = c.listen_channel_id
         with self.assertRaises(ValueError):
             c.validate()
+
+    def test_config_types_and_author_ids(self):
+        c = config(Path("/tmp"), allowed_author_ids=["123456789012345678", 4])
+        c.validate()
+        self.assertEqual(c.allowed_author_ids, [123456789012345678, 4])
+        for kwargs in ({"auto_merge": "false", "allowed_author_ids": [4]},
+                       {"require_ci": "true", "allowed_author_ids": [4]},
+                       {"reviewers": "2", "allowed_author_ids": [4]},
+                       {"allowed_author_ids": ["abc"]},
+                       {"allowed_author_ids": [True]},
+                       {"allowed_author_ids": []}):
+            with self.assertRaises(ValueError, msg=kwargs):
+                config(Path("/tmp"), **kwargs).validate()
+        config(Path("/tmp"), auto_merge=False).validate()
 
     def test_environment_removes_coordinator_secrets(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"DISCORD_TOKEN": "secret", "GH_TOKEN": "github", "ANTHROPIC_API_KEY": "model-key"}):
@@ -107,6 +126,10 @@ class StoreTests(unittest.TestCase):
             self.assertIsNone(store.next_job())
             self.assertTrue(store.retry_failed("111"))
             self.assertEqual(store.next_job()["data"]["pr"], 1)
+            store.save("111", status="failed", data={"pr": 1, "ci_wait_since": 1.0, "ci_notified": True})
+            self.assertTrue(store.retry_failed("111"))
+            self.assertEqual(store.next_job()["data"], {"pr": 1})
+            self.assertFalse(store.retry_failed("missing"))
             store.set_cursor(2, 200)
             store.set_cursor(2, 100)
             self.assertEqual(store.cursor(2), "200")
@@ -368,6 +391,12 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_large_stdin_with_large_output_does_not_deadlock(self):
+        script = "import sys; sys.stdout.write('x' * 300000); sys.stdout.flush(); print(len(sys.stdin.read()))"
+        result = await run([sys.executable, "-c", script], stdin="y" * 300000, timeout=20)
+        self.assertEqual(result.code, 0)
+        self.assertTrue(result.output.rstrip().endswith("300000"))
+
     async def test_native_quota_rpc_with_installed_cli_protocol(self):
         with tempfile.TemporaryDirectory() as tmp:
             cli = Path(tmp) / "fake-codex"

@@ -45,15 +45,18 @@ async def run(argv: list[str], *, cwd: Path | None = None,
     output = bytearray()
     log = transcript.open("ab") if transcript else None
 
-    async def collect() -> None:
-        if stdin is not None:
-            try:
-                proc.stdin.write(stdin.encode())
-                await proc.stdin.drain()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            finally:
-                proc.stdin.close()
+    async def feed() -> None:
+        if stdin is None:
+            return
+        try:
+            proc.stdin.write(stdin.encode())
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            proc.stdin.close()
+
+    async def drain_output() -> None:
         while chunk := await proc.stdout.read(8192):
             if log:
                 log.write(chunk)
@@ -61,6 +64,10 @@ async def run(argv: list[str], *, cwd: Path | None = None,
             output.extend(chunk)
             if len(output) > 2_000_000:
                 del output[:-2_000_000]
+
+    async def collect() -> None:
+        # Feed stdin while reading stdout so a large prompt cannot deadlock against a full output pipe.
+        await asyncio.gather(feed(), drain_output())
         await proc.wait()
 
     try:

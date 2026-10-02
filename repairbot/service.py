@@ -50,7 +50,8 @@ async def serve(config: Config, store: Store) -> None:
     channel = None
     listen = None
     worker = None
-    init_error = None
+    fatal_error = None
+    closing = None
     ingest_lock = asyncio.Lock()
 
     async def report(text: str) -> None:
@@ -83,6 +84,15 @@ async def serve(config: Config, store: Store) -> None:
             else:
                 await asyncio.sleep(2)
 
+    def worker_stopped(task: asyncio.Task) -> None:
+        nonlocal fatal_error, closing
+        if task.cancelled() or task.exception() is None:
+            return
+        # Exit instead of staying connected while no job is processed; a supervisor can restart the service.
+        fatal_error = RuntimeError(f"任务 worker 意外退出：{task.exception()}")
+        log.error("Job worker crashed", exc_info=task.exception())
+        closing = asyncio.create_task(client.close())
+
     async def ingest(message) -> None:
         enqueue_message(config, store, message, client.user.id)
 
@@ -104,7 +114,7 @@ async def serve(config: Config, store: Store) -> None:
 
     @client.event
     async def on_ready():
-        nonlocal channel, listen, worker, init_error
+        nonlocal channel, listen, worker, fatal_error
         try:
             channel = await client.fetch_channel(config.report_channel_id)
             listen = await client.fetch_channel(config.listen_channel_id)
@@ -125,12 +135,9 @@ async def serve(config: Config, store: Store) -> None:
                 state = "；".join(f"{p.name}: {'未安装' if not p.executable else p.auth}" for p in scheduler.providers)
                 await report("自动修复服务已启动。仓库：" + config.repository + "。工具：" + state)
                 worker = asyncio.create_task(consume())
-            elif worker.done():
-                error = worker.exception()
-                if error:
-                    raise RuntimeError("任务 worker 意外退出") from error
+                worker.add_done_callback(worker_stopped)
         except Exception as exc:
-            init_error = exc
+            fatal_error = RuntimeError(f"Discord 初始化失败：{exc}")
             log.exception("Discord initialization failed")
             await client.close()
 
@@ -145,8 +152,8 @@ async def serve(config: Config, store: Store) -> None:
 
     try:
         await client.start(token)
-        if init_error:
-            raise RuntimeError(f"Discord 初始化失败：{init_error}") from init_error
+        if fatal_error:
+            raise fatal_error
     finally:
         if worker:
             worker.cancel()

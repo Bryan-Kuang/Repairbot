@@ -68,9 +68,16 @@ class Store:
         return row[0] if row else 0
 
     def retry_failed(self, job_id: str) -> bool:
+        row = self.db.execute("SELECT data FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            return False
+        data = json.loads(row[0])
+        # A manual retry starts a fresh CI wait window and re-announces progress.
+        data.pop("ci_wait_since", None)
+        data.pop("ci_notified", None)
         cur = self.db.execute(
-            "UPDATE jobs SET status='queued',retry_at=0,updated=? WHERE id=? AND status IN ('failed','waiting')",
-            (time.time(), job_id),
+            "UPDATE jobs SET status='queued',retry_at=0,updated=?,data=? WHERE id=? AND status IN ('failed','waiting')",
+            (time.time(), json.dumps(data, ensure_ascii=False), job_id),
         )
         self.db.commit()
         return bool(cur.rowcount)

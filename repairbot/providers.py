@@ -98,18 +98,19 @@ LIMIT_PATTERN = re.compile(r"(?i)(usage[_ -]?limit|rate[_ -]?limit|quota[_ -]?(?
 
 
 def quota_exhausted(result) -> bool:
-    if result.code != 0 and LIMIT_PATTERN.search(result.output):
-        return True
-    lines = result.output.splitlines()
+    objects, plain = [], []
     try:
-        lines.append(json.dumps(json.loads(result.output)))
+        objects.append(json.loads(result.output))
     except ValueError:
-        pass
-    for line in lines:
-        try:
-            obj = json.loads(line)
-        except ValueError:
-            continue
+        for line in result.output.splitlines():
+            try:
+                objects.append(json.loads(line))
+            except ValueError:
+                plain.append(line)
+    # Plain lines are CLI stderr; JSON events may quote source code or incident text, so only trust error envelopes.
+    if result.code != 0 and LIMIT_PATTERN.search("\n".join(plain)):
+        return True
+    for obj in objects:
         if not isinstance(obj, dict):
             continue
         if obj.get("type") in ("error", "turn.failed") or obj.get("is_error") is True:

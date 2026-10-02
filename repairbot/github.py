@@ -29,6 +29,10 @@ class BranchBehind(RuntimeError):
     pass
 
 
+class NeedsHumanApproval(RuntimeError):
+    pass
+
+
 def trusted_config(repo: Path) -> Path:
     # Kept outside the working tree so AI sessions confined to the repository cannot modify it.
     return repo.parent / f".{repo.name}.gitconfig"
@@ -156,7 +160,7 @@ class GitHub:
 
     async def pr(self, number: int | str) -> dict:
         return json.loads(await self.gh("pr", "view", str(number), "--repo", self.config.repository,
-                                        "--json", "number,url,state,headRefOid,baseRefOid,baseRefName,mergeStateStatus,mergeable,isDraft,statusCheckRollup"))
+                                        "--json", "number,url,state,headRefOid,baseRefOid,baseRefName,mergeStateStatus,mergeable,isDraft,statusCheckRollup,reviewDecision"))
 
     async def review_copy(self, repo: Path, target: Path, sha: str) -> Path:
         if not target.exists():
@@ -216,11 +220,22 @@ class GitHub:
             raise BranchBehind("分支保护要求 PR 与目标分支同步")
         if pr["mergeable"] == "UNKNOWN" or pr["mergeStateStatus"] == "UNKNOWN":
             raise PendingCI("GitHub 正在计算合并状态")
+        # The PR is opened by the coordinator's own account, and GitHub never lets an author approve their own PR.
+        if pr.get("reviewDecision") == "REVIEW_REQUIRED":
+            raise NeedsHumanApproval("仓库要求人工批准 PR；Repairbot 用创建 PR 的同一账号操作，无法自行批准")
+        if pr.get("reviewDecision") == "CHANGES_REQUESTED":
+            raise NeedsHumanApproval("GitHub 上有审查者要求修改此 PR")
         if pr["mergeable"] != "MERGEABLE" or pr["mergeStateStatus"] not in ("CLEAN", "HAS_HOOKS"):
             raise RuntimeError(f"GitHub 分支保护或冲突阻止合并：{pr['mergeStateStatus']}")
         # gh --match-head-commit prevents a changed head from slipping through the final request.
-        await self.gh("pr", "merge", str(number), "--repo", self.config.repository,
-                      "--squash", "--match-head-commit", sha)
+        try:
+            await self.gh("pr", "merge", str(number), "--repo", self.config.repository,
+                          "--squash", "--match-head-commit", sha)
+        except RuntimeError as exc:
+            text = str(exc).lower()
+            if any(marker in text for marker in ("permission", "not authorized", "resource not accessible", "http 403")):
+                raise NeedsHumanApproval("gh 账号没有此仓库的合并权限：" + str(exc)[-500:]) from exc
+            raise
         final = await self.pr(number)
         if final["state"] != "MERGED":
             raise PendingCI("GitHub 尚未完成合并")

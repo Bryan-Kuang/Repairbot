@@ -107,6 +107,7 @@ repairbot run --config config.json
 - 默认 `require_ci=true`，必须有 GitHub 检查且所有检查成功；失败、跳过、取消都不算通过。运行中的检查每分钟重查，等待超过 24 小时停止。没有 CI 的仓库应先配置 CI；确实不需要 CI 时可明确设 `require_ci=false`，已有检查仍必须通过；此时 PR 创建后 5 分钟内若没有任何检查，仍会等待，避免在 CI 注册前合并。
 - 合并前核对审查的 head SHA；PR 提交变化时旧审查失效。目标分支前进而 PR 提交不变时，审查过的 diff（相对 merge-base）不变，审查继续有效。分支保护要求 PR 与目标分支同步（`BEHIND`）时，服务调用 `gh pr update-branch` 合入目标分支，再对新提交重新审查，最多 3 次。最终使用 `gh pr merge --squash --match-head-commit` 防止换提交后沿用旧审查。**生产仓库应启用严格“分支必须与目标分支同步”和 required checks 保护，以免目标分支的新改动与修复在语义上冲突。**
 - `auto_merge=false` 时完成修复与审查后只报告 PR，留待人工合并。
+- 仓库要求人工批准（GitHub 显示 `REVIEW_REQUIRED`）、有人要求修改，或 `gh` 账号没有合并权限时，报告频道会明确说明原因和 PR 链接，任务标为 `failed` 并停在合并阶段。PR 由协调器账号创建，GitHub 不允许它批准自己的 PR，所以 AI 审查不能代替人工批准。人工批准后可直接合并，或执行 `retry` 由 Repairbot 合并。
 
 ## 配置与维护
 

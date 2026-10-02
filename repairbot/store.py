@@ -27,6 +27,9 @@ class Store:
         if "started" not in columns:
             self.db.execute("ALTER TABLE jobs ADD COLUMN started REAL NOT NULL DEFAULT 0")
         self.db.execute("CREATE INDEX IF NOT EXISTS jobs_fingerprint ON jobs(fingerprint)")
+        providers = {row[1] for row in self.db.execute("PRAGMA table_info(providers)")}
+        if "source" not in providers:
+            self.db.execute("ALTER TABLE providers ADD COLUMN source TEXT NOT NULL DEFAULT 'session'")
         self.db.commit()
 
     def enqueue(self, job_id: str, content: str, fingerprint: str | None = None, dedup_window: float = 0) -> bool:
@@ -86,8 +89,13 @@ class Store:
         )
         self.db.commit()
 
-    def block(self, name: str, until: float) -> None:
-        self.db.execute("INSERT OR REPLACE INTO providers VALUES(?,?)", (name, until))
+    def block(self, name: str, until: float, source: str = "session") -> None:
+        self.db.execute("INSERT OR REPLACE INTO providers(name,blocked_until,source) VALUES(?,?,?)", (name, until, source))
+        self.db.commit()
+
+    def unblock_query(self, name: str) -> None:
+        # A quota query may lift only its own blocks; a limit the CLI reported holds until it expires.
+        self.db.execute("DELETE FROM providers WHERE name=? AND source='query'", (name,))
         self.db.commit()
 
     def blocked_until(self, name: str) -> float:

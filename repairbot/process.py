@@ -16,6 +16,13 @@ def redact(text: str) -> str:
     return re.sub(r"(?i)(authorization\s*:\s*(?:bearer|bot)\s+)\S+", r"\1[REDACTED]", text)
 
 
+def coordinator_environment() -> dict[str, str]:
+    # The Discord token is only used in-process; no child process (git, gh, tests, hooks) needs it.
+    env = os.environ.copy()
+    env.pop("DISCORD_TOKEN", None)
+    return env
+
+
 def agent_environment(state_dir: Path) -> dict[str, str]:
     env = os.environ.copy()
     for key in ("DISCORD_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
@@ -38,7 +45,7 @@ async def run(argv: list[str], *, cwd: Path | None = None,
               env: dict[str, str] | None = None, stdin: str | None = None,
               timeout: int = 120, transcript: Path | None = None) -> Result:
     proc = await asyncio.create_subprocess_exec(
-        *argv, cwd=cwd, env=env, stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
+        *argv, cwd=cwd, env=env if env is not None else coordinator_environment(), stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         start_new_session=os.name != "nt",
     )

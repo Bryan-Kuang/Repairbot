@@ -44,7 +44,7 @@ cp config.example.json config.json
 repairbot doctor --config config.json
 ```
 
-`doctor` 只检测登录状态，不启动付费 AI 会话、不安装工具、不发起登录、不输出凭据。Claude 旧版本不支持 `auth status` 时标记为 `unknown`，运行阶段交由 CLI 自己验证，不通过读取认证文件推断登录状态。检测顺序包括 PATH、`~/.local/bin`、npm-global、bun、nvm 和 Volta；可用 `providers.<name>.executable` 指定绝对路径。
+`doctor` 只检测登录状态，不启动付费 AI 会话、不安装工具、不发起登录、不输出凭据，也不改变服务记录的额度冷却。Claude 旧版本不支持 `auth status` 时标记为 `unknown`，运行阶段交由 CLI 自己验证，不通过读取认证文件推断登录状态。检测顺序包括 PATH、`~/.local/bin`、npm-global、bun、nvm 和 Volta；可用 `providers.<name>.executable` 指定绝对路径。
 
 如诊断确认缺少登录，按需运行 `gh auth login`、`codex login` 或 `claude`。`gh` 身份须有仓库内容、PR 写入和合并权限，仓库须允许 squash merge；程序不会使用管理员权限绕过分支保护。私有仓库克隆、git push 应能在该账户下非交互完成，必要时执行 `gh auth setup-git`。
 
@@ -95,21 +95,22 @@ repairbot run --config config.json
 
 修复会话被要求持续维护 `.repairbot-progress-<消息ID>.md`，成功后移到任务目录，不提交进 PR。完整输出逐块落盘，进程超时或服务中断时已有输出不会丢失。完整日志可能包含源代码和报错数据，请保管 `.repairbot/`。
 
-两者都耗尽时，在报告频道提醒并将任务标为 `waiting`。有明确重置时间时到时重试，否则按 `cooldown_seconds`（默认 1 小时）重试；额度查询确认恢复时也会解除冷却。无可用登录时同样提醒和等待，安装或登录后需重启服务重新探测。普通启动失败、超时和无效 JSON 会尝试另一工具，全部失败则保留任务为 `failed`。
+两者都耗尽时，在报告频道提醒并将任务标为 `waiting`。有明确重置时间时到时重试，否则按 `cooldown_seconds`（默认 1 小时）重试；额度查询确认恢复时会解除由查询本身设置的冷却；CLI 运行时报告的额度耗尽则保持到重置时间或 `cooldown_seconds` 结束，避免查询脚本与实际限额桶不一致时反复开出失败的会话。无可用登录时同样提醒和等待，安装或登录后需重启服务重新探测。普通启动失败、超时和无效 JSON 会尝试另一工具，全部失败则保留任务为 `failed`；若其中有工具只是额度耗尽，任务改为 `waiting`，额度恢复后重试。
 
 ## 审查与自动合并
 
 - 每个报错使用独立分支和克隆目录；队列串行执行，避免多个修复争用工作目录。SQLite 保存阶段，重启可继续；同一状态目录禁止同时运行两个服务。
-- 本地测试来自 `test_commands` 参数数组，例如 Python 项目填 `[["python3", "-m", "pytest", "-q"]]`，Node 项目填 `[["npm", "test", "--", "--runInBand"]]`。依赖需在运行机器准备好。空数组表示不额外执行本地测试，不代表测试已通过。
-- `reviewers` 为 `1` 或 `2`，默认 `2`。每个审查有独立目录和新会话，没有其他审查者的结论。完整 diff 由协调器生成，便于只读工具直接读取。
+- 本地测试来自 `test_commands` 参数数组，例如 Python 项目填 `[["python3", "-m", "pytest", "-q"]]`，Node 项目填 `[["npm", "test", "--", "--runInBand"]]`。依赖需在运行机器准备好。空数组表示不额外执行本地测试，不代表测试已通过。协调器先在本地提交修复，再运行测试，测试结束后丢弃测试产生的未跟踪文件和改动；提交时也排除 `__pycache__`、`.pytest_cache`、`.coverage`、`node_modules` 等常见缓存，AI 会话自己跑测试留下的这类文件不会进入 PR。AI 新建的其他文件仍会提交，由审查把关。
+- `protected_paths` 是 fnmatch 模式数组（`*` 可跨目录），默认 `.github/*`、`CODEOWNERS`、`.gitmodules`、`.gitattributes`。PR 改动命中这些路径，或删除了任何文件时，仍会创建 PR 并完成审查，但不自动合并，留待人工处理。
+- `reviewers` 为 `1` 或 `2`，默认 `2`。每个审查有独立目录和新会话，没有其他审查者的结论。每个审查都优先避开写修复的工具；只有两个工具时，两次审查可能使用同一工具的两个新会话。完整 diff 由协调器生成，便于只读工具直接读取。
 - 不应修复、修复失败、测试失败、审查拒绝、提交改变或分支保护阻挡都会停止自动合并并报告。已创建 PR 保留供人工处理；本版本不会循环修改以追求审查通过。
-- 默认 `require_ci=true`，必须有 GitHub 检查且所有检查成功；失败、跳过、取消都不算通过。运行中的检查每分钟重查，等待超过 24 小时停止。没有 CI 的仓库应先配置 CI；确实不需要 CI 时可明确设 `require_ci=false`，已有检查仍必须通过。
-- 合并前核对审查的 head SHA 和 base SHA；PR 或目标分支变化时旧审查失效。最终使用 `gh pr merge --squash --match-head-commit` 防止换提交后沿用旧审查。**GitHub 的 head 校验是请求级保护，base 校验仍存在检查与请求之间的竞态；生产仓库应启用严格“分支必须与目标分支同步”和 required checks 保护。**
+- 默认 `require_ci=true`，必须有 GitHub 检查且所有检查成功；失败、跳过、取消都不算通过。运行中的检查每分钟重查，等待超过 24 小时停止。没有 CI 的仓库应先配置 CI；确实不需要 CI 时可明确设 `require_ci=false`，已有检查仍必须通过；此时 PR 创建后 5 分钟内若没有任何检查，仍会等待，避免在 CI 注册前合并。
+- 合并前核对审查的 head SHA；PR 提交变化时旧审查失效。目标分支前进而 PR 提交不变时，审查过的 diff（相对 merge-base）不变，审查继续有效。分支保护要求 PR 与目标分支同步（`BEHIND`）时，服务调用 `gh pr update-branch` 合入目标分支，再对新提交重新审查，最多 3 次。最终使用 `gh pr merge --squash --match-head-commit` 防止换提交后沿用旧审查。**生产仓库应启用严格“分支必须与目标分支同步”和 required checks 保护，以免目标分支的新改动与修复在语义上冲突。**
 - `auto_merge=false` 时完成修复与审查后只报告 PR，留待人工合并。
 
 ## 配置与维护
 
-`allowed_author_ids` 限定可信的用户、日志 Bot 或 webhook 作者 ID，可写数字或数字字符串。`auto_merge=true` 时必须非空，否则启动报错，避免任何频道成员都能触发自动合并；空数组仅在 `auto_merge=false` 时允许，此时接受频道里所有作者。`auto_merge`、`require_ci` 必须为 JSON 布尔值，不接受字符串 `"false"`。默认 `error_pattern` 匹配 error / exception / traceback / fatal / panic / 报错 / 错误；若日志格式不同，可更改正则或使用 `(?s).+` 处理所有非空文本。会读取消息文本和 embed 标题、描述、字段；不下载附件，也不执行报错消息中的指令。单条报错最多读取 `max_message_chars` 个字符，默认 24000。
+`allowed_author_ids` 限定可信的用户、日志 Bot 或 webhook 作者 ID，可写数字或数字字符串，必须非空，否则启动报错：报错文本会进入能修改代码、运行测试的 AI 会话，不能让任何频道成员都能触发。配置中的未知项、无效正则和类型错误会在启动时给出中文提示。`auto_merge`、`require_ci` 必须为 JSON 布尔值，不接受字符串 `"false"`。默认 `error_pattern` 匹配 error / exception / traceback / fatal / panic / 报错 / 错误；若日志格式不同，可更改正则或使用 `(?s).+` 处理所有非空文本。会读取消息文本和 embed 标题、描述、字段；不下载附件，也不执行报错消息中的指令。单条报错最多读取 `max_message_chars` 个字符，默认 24000。
 
 **去重与限流**：同一错误反复出现时不会重复消耗额度或重复开 PR。
 
@@ -131,6 +132,6 @@ python3 -m unittest discover -s tests -v
 
 ## 运行隔离与验证范围
 
-Codex 判断/审查使用 `read-only`，修复使用 `workspace-write`，不自动批准越界执行。Claude 判断/审查只开放 Read / Glob / Grep；修复开放读写与 Bash，以 `acceptEdits` 非交互运行。服务对 AI 子进程移除 Discord / GitHub Token 并使用空的 `GH_CONFIG_DIR`，但**这不构成 Claude 的操作系统沙箱**，也不能隔离机器上的其他凭据、git helper、SSH key 或第三方 MCP 配置。请在专用账户或独立运行机器上部署，按需要在容器/虚拟机中登录 CLI；不要让不可信报错触发带有个人敏感凭据的宿主机执行。协调器执行的测试同样具有该账户权限。
+Codex 判断/审查使用 `read-only`，修复使用 `workspace-write`，不自动批准越界执行。Claude 判断/审查只开放 Read / Glob / Grep；修复开放读写，以 `acceptEdits` 非交互运行，Bash 只允许 `test_commands` 中的命令（未配置时不开放 Bash）。服务对 AI 子进程移除 Discord / GitHub Token 并使用空的 `GH_CONFIG_DIR`；Discord Token 不传给任何子进程。AI 会话可写入工作目录中的 `.git/`，因此协调器每次执行 git 前，用克隆时保存在工作目录外的快照恢复 `.git/config`，并禁用 hooks 和 fsmonitor，防止植入的钩子或配置带着协调器凭据执行。但**这不构成 Claude 的操作系统沙箱**，也不能隔离机器上的其他凭据、git helper、SSH key 或第三方 MCP 配置。请在专用账户或独立运行机器上部署，按需要在容器/虚拟机中登录 CLI；不要让不可信报错触发带有个人敏感凭据的宿主机执行。协调器执行的测试、以及允许 AI 运行的测试命令都会执行仓库代码，同样具有该账户权限。
 
 本地测试覆盖额度调度、真实子进程超时保留输出、切换上下文、持久化恢复、PR 流程、独立克隆、审查拒绝、CI 与提交校验。Discord / GitHub / AI 服务写入使用模拟适配器测试。未提供真实服务器、频道与 Token 时不会替你启动线上 Bot，或向真实仓库创建测试 PR。

@@ -64,6 +64,7 @@ async def serve(config: Config, store: Store) -> None:
     worker = None
     fatal_error = None
     closing = None
+    synced = False
     ingest_lock = asyncio.Lock()
 
     async def report(text: str) -> None:
@@ -109,6 +110,7 @@ async def serve(config: Config, store: Store) -> None:
         enqueue_message(config, store, message, client.user.id)
 
     async def catch_up() -> None:
+        nonlocal synced
         cursor = store.cursor(config.listen_channel_id)
         if cursor:
             after = discord.Object(id=int(cursor))
@@ -123,6 +125,7 @@ async def serve(config: Config, store: Store) -> None:
         if store.cursor(config.listen_channel_id) is None:
             # No replay requested / empty channel: establish a cursor for subsequent reconnects.
             store.set_cursor(config.listen_channel_id, discord.utils.time_snowflake(discord.utils.utcnow()))
+        synced = True
 
     @client.event
     async def on_ready():
@@ -154,13 +157,28 @@ async def serve(config: Config, store: Store) -> None:
             await client.close()
 
     @client.event
+    async def on_disconnect():
+        nonlocal synced
+        # Messages may be missed while disconnected; replay history before advancing the watermark again.
+        synced = False
+
+    @client.event
+    async def on_resumed():
+        if listen is None:
+            return
+        async with ingest_lock:
+            await catch_up()
+
+    @client.event
     async def on_message(message):
         if listen is None or message.channel.id != config.listen_channel_id:
             return
         async with ingest_lock:
-            # Replay is idempotent; never advance the replay watermark over an unprocessed gap.
-            await catch_up()
+            # Only read history after a gap; otherwise live events arrive in order and need no API call.
+            if not synced:
+                await catch_up()
             await ingest(message)
+            store.set_cursor(config.listen_channel_id, message.id)
 
     try:
         await client.start(token)

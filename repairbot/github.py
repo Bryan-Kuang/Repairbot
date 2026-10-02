@@ -1,14 +1,63 @@
 from __future__ import annotations
 
+import asyncio
+import fnmatch
 import json
+import os
 from pathlib import Path
 
 from .config import Config
 from .process import agent_environment, checked, run
 
+# AI sessions can write inside the working tree, including .git/. Never let a planted hook or
+# config entry (core.fsmonitor, filters, sshCommand, pushurl...) run with coordinator credentials.
+GIT_HARDENING = ["-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false"]
+
+
+# Caches and build output that test runs (by the AI session or the coordinator) leave behind.
+GENERATED = ["__pycache__", "*.pyc", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".coverage",
+             "htmlcov", "node_modules", ".DS_Store"]
+COMMIT_PATHSPEC = ["."] + [f":(exclude,glob){prefix}{name}{suffix}" for name in GENERATED
+                           for prefix in ("", "**/") for suffix in ("", "/**")]
+
 
 class PendingCI(RuntimeError):
     pass
+
+
+class BranchBehind(RuntimeError):
+    pass
+
+
+def trusted_config(repo: Path) -> Path:
+    # Kept outside the working tree so AI sessions confined to the repository cannot modify it.
+    return repo.parent / f".{repo.name}.gitconfig"
+
+
+def restore_config(repo: Path) -> None:
+    snapshot = trusted_config(repo)
+    if not snapshot.is_file():
+        return
+    git_dir = repo / ".git"
+    if git_dir.is_symlink() or not git_dir.is_dir():
+        raise RuntimeError(f"{repo} 的 .git 目录已被替换，停止执行")
+    config = git_dir / "config"
+    trusted = snapshot.read_bytes()
+    if config.is_symlink() or not config.is_file() or config.read_bytes() != trusted:
+        config.unlink(missing_ok=True)
+        config.write_bytes(trusted)
+
+
+def changed_path_risks(name_status: str, patterns: list[str]) -> list[str]:
+    risks = []
+    for line in name_status.splitlines():
+        status, *paths = line.split("\t")
+        if status.startswith("D"):
+            risks.append(f"删除 {paths[0]}")
+        for path in paths:
+            if any(fnmatch.fnmatch(path, pattern) for pattern in patterns):
+                risks.append(f"修改受保护路径 {path}")
+    return list(dict.fromkeys(risks))
 
 
 class GitHub:
@@ -19,7 +68,12 @@ class GitHub:
         return await checked(["gh", *args], cwd=cwd, timeout=180)
 
     async def git(self, cwd: Path, *args: str) -> str:
-        return await checked(["git", *args], cwd=cwd, timeout=180)
+        restore_config(cwd)
+        return await checked(["git", *GIT_HARDENING, *args], cwd=cwd, timeout=180)
+
+    async def trust(self, repo: Path) -> None:
+        if not trusted_config(repo).is_file():
+            trusted_config(repo).write_bytes((repo / ".git" / "config").read_bytes())
 
     async def prepare(self, root: Path, branch: str) -> tuple[Path, str]:
         repo = root / "repo"
@@ -28,16 +82,17 @@ class GitHub:
                 raise RuntimeError(f"不完整克隆目录 {repo}；请检查后移走再重试")
             root.mkdir(parents=True, exist_ok=True)
             await self.gh("repo", "clone", self.config.repository, str(repo))
+            await self.git(repo, "config", "user.name", "Discord Repair Bot")
+            await self.git(repo, "config", "user.email", "repairbot@users.noreply.github.com")
+        await self.trust(repo)
         metadata = json.loads(await self.gh("repo", "view", self.config.repository, "--json", "defaultBranchRef"))
         base = metadata["defaultBranchRef"]["name"]
         await self.git(repo, "fetch", "origin", base)
-        exists = await run(["git", "rev-parse", "--verify", f"refs/heads/{branch}"], cwd=repo)
+        exists = await run(["git", *GIT_HARDENING, "rev-parse", "--verify", f"refs/heads/{branch}"], cwd=repo)
         if exists.code:
             await self.git(repo, "checkout", "-b", branch, f"origin/{base}")
         else:
             await self.git(repo, "checkout", branch)
-        await self.git(repo, "config", "user.name", "Discord Repair Bot")
-        await self.git(repo, "config", "user.email", "repairbot@users.noreply.github.com")
         return repo, base
 
     async def head(self, repo: Path) -> str:
@@ -51,6 +106,24 @@ class GitHub:
         expected = self.config.repository
         if url not in (f"https://github.com/{expected}", f"git@github.com:{expected}", f"ssh://git@github.com/{expected}"):
             raise RuntimeError("工作目录 origin 已改变，停止自动发布")
+
+    async def commit(self, repo: Path, title: str) -> None:
+        if await self.clean(repo):
+            return
+        await self.git(repo, "add", "--all", "--", *COMMIT_PATHSPEC)
+        restore_config(repo)
+        staged = await run(["git", *GIT_HARDENING, "diff", "--cached", "--quiet"], cwd=repo)
+        if staged.code:
+            await self.git(repo, "commit", "-m", title)
+
+    async def discard(self, repo: Path) -> None:
+        # Drop files produced by test runs (caches, coverage, build output) so they never reach the PR.
+        await self.git(repo, "reset", "--hard", "HEAD")
+        await self.git(repo, "clean", "-fd")
+
+    async def risky_changes(self, repo: Path, base_sha: str, sha: str) -> list[str]:
+        diff = await self.git(repo, "diff", "--no-ext-diff", "--no-renames", "--name-status", f"{base_sha}...{sha}", "--")
+        return changed_path_risks(diff, self.config.protected_paths)
 
     async def tests(self, repo: Path, artifacts: Path) -> None:
         for index, command in enumerate(self.config.test_commands):
@@ -71,9 +144,7 @@ class GitHub:
             if pr["state"] == "CLOSED":
                 raise RuntimeError("此修复 PR 已被关闭，停止自动重开")
             return pr
-        if not await self.clean(repo):
-            await self.git(repo, "add", "--all")
-            await self.git(repo, "commit", "-m", title)
+        await self.commit(repo, title)
         if not (await self.git(repo, "diff", "--stat", f"origin/{base}...HEAD")).strip():
             raise RuntimeError("AI 没有产生可提交的修复")
         await self.git(repo, "push", "origin", f"HEAD:refs/heads/{branch}")
@@ -89,23 +160,36 @@ class GitHub:
 
     async def review_copy(self, repo: Path, target: Path, sha: str) -> Path:
         if not target.exists():
-            await checked(["git", "clone", "--no-hardlinks", "--", str(repo), str(target)], timeout=180)
+            await checked(["git", *GIT_HARDENING, "clone", "--no-hardlinks", "--", str(repo), str(target)], timeout=180)
+        await self.trust(target)
         if not await self.clean(target):
             raise RuntimeError("审查目录已有文件改动，停止自动审查")
         await self.git(target, "fetch", "origin")
         await self.git(target, "checkout", "--detach", sha)
         return target
 
-    async def assert_version(self, number: int, sha: str, base_sha: str) -> dict:
+    async def assert_version(self, number: int, sha: str) -> dict:
+        # The base branch may advance: the reviewed diff (merge-base...head) is unchanged while the head is.
         pr = await self.pr(number)
-        if pr["headRefOid"] != sha or pr["baseRefOid"] != base_sha:
-            raise RuntimeError("PR 或目标分支版本已改变，已有审查失效；停止自动合并")
+        if pr["headRefOid"] != sha:
+            raise RuntimeError("PR 提交已改变，已有审查失效；停止自动合并")
         if pr["state"] not in ("OPEN", "MERGED"):
             raise RuntimeError("PR 已关闭")
         return pr
 
-    async def merge(self, number: int, sha: str, base_sha: str) -> None:
-        pr = await self.assert_version(number, sha, base_sha)
+    async def update_branch(self, number: int, *, attempts: int = 15) -> dict:
+        before = (await self.pr(number))["headRefOid"]
+        await self.gh("pr", "update-branch", str(number), "--repo", self.config.repository)
+        # GitHub creates the merge commit asynchronously.
+        for _ in range(attempts):
+            pr = await self.pr(number)
+            if pr["headRefOid"] != before:
+                return pr
+            await asyncio.sleep(2)
+        raise RuntimeError("GitHub 未在预期时间内更新 PR 分支")
+
+    async def merge(self, number: int, sha: str, *, checks_grace: bool = False) -> None:
+        pr = await self.assert_version(number, sha)
         if pr["state"] == "MERGED":
             return
         if pr["isDraft"]:
@@ -126,8 +210,12 @@ class GitHub:
                     raise RuntimeError(f"CI 未成功：{check.get('name', check.get('conclusion'))}")
         if self.config.require_ci and not checks:
             raise PendingCI("仓库尚无 CI 结果；require_ci=true，等待检查出现")
-        if pr["mergeable"] == "UNKNOWN" or pr["mergeStateStatus"] in ("UNKNOWN", "BEHIND"):
-            raise PendingCI("GitHub 正在计算合并状态，或目标分支已前进")
+        if not checks and checks_grace:
+            raise PendingCI("等待可能存在的 CI 检查注册")
+        if pr["mergeStateStatus"] == "BEHIND":
+            raise BranchBehind("分支保护要求 PR 与目标分支同步")
+        if pr["mergeable"] == "UNKNOWN" or pr["mergeStateStatus"] == "UNKNOWN":
+            raise PendingCI("GitHub 正在计算合并状态")
         if pr["mergeable"] != "MERGEABLE" or pr["mergeStateStatus"] not in ("CLEAN", "HAS_HOOKS"):
             raise RuntimeError(f"GitHub 分支保护或冲突阻止合并：{pr['mergeStateStatus']}")
         # gh --match-head-commit prevents a changed head from slipping through the final request.

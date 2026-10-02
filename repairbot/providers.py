@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import time
 from dataclasses import dataclass
@@ -167,7 +168,7 @@ class Scheduler:
                           for name in ("codex", "claude")
                           for pc in [config.providers.get(name, ProviderConfig())]]
 
-    async def refresh(self) -> None:
+    async def refresh(self, persist: bool = True) -> None:
         for provider in self.providers:
             provider.quota = Quota()
             provider.quota_error = None
@@ -185,10 +186,13 @@ class Scheduler:
                     provider.quota = Quota.parse(json.dumps(normalize_usage(usage)))
                 else:
                     continue
+                if not persist:
+                    continue
                 if provider.quota.remaining_fraction == 0:
-                    self.store.block(provider.name, max(time.time() + 1, provider.quota.reset_at or time.time() + self.config.cooldown_seconds))
+                    self.store.block(provider.name, max(time.time() + 1, provider.quota.reset_at or time.time() + self.config.cooldown_seconds),
+                                     "query")
                 elif provider.quota.remaining_fraction is not None:
-                    self.store.block(provider.name, 0)
+                    self.store.unblock_query(provider.name)
             except (OSError, TimeoutError, ValueError, AttributeError, KeyError, TypeError) as exc:
                 provider.quota_error = redact(str(exc))
 
@@ -213,6 +217,7 @@ class Scheduler:
         await self.refresh()
         tried: set[str] = set()
         failures: list[str] = []
+        exhausted = False
         while options := self.ranked(tried, avoid):
             provider = options[0]
             tried.add(provider.name)
@@ -233,6 +238,7 @@ class Scheduler:
             if quota_exhausted(result):
                 until = provider.quota.reset_at or time.time() + self.config.cooldown_seconds
                 self.store.block(provider.name, max(time.time() + 1, until))
+                exhausted = True
                 await self.report(f"{provider.name} 额度耗尽，保留输出及工作目录，切换工具")
                 continue
             if result.code:
@@ -243,8 +249,11 @@ class Scheduler:
                 return final_response(result.output), provider.name
             except ProviderFailure as exc:
                 failures.append(f"{provider.name}: {exc}")
-        if failures:
+        if failures and not exhausted:
             raise ProviderFailure("；".join(failures))
+        if failures:
+            # One tool failed, another only ran out of quota: wait for the quota instead of giving up.
+            raise NoCapacity("部分工具额度耗尽，其余工具失败（" + "；".join(f[:300] for f in failures) + "）")
         raise NoCapacity("所有已安装且可用的 AI 工具额度耗尽，或没有已登录的可用工具")
 
     def command(self, provider: Provider, phase: str) -> list[str]:
@@ -255,9 +264,17 @@ class Scheduler:
             if provider.config.model:
                 argv += ["--model", provider.config.model]
             return argv + ["-"]
+        tools = ["Read", "Glob", "Grep"]
+        allowed = list(tools)
+        if writable:
+            tools += ["Edit", "Write"]
+            allowed += ["Edit", "Write"]
+            if self.config.test_commands:
+                # Bash only for the configured test commands; anything else is denied in non-interactive mode.
+                tools.append("Bash")
+                allowed += [f"Bash({shlex.join(argv)}:*)" for argv in self.config.test_commands]
         argv = [provider.executable, "-p", "--output-format", "json", "--permission-mode", "acceptEdits" if writable else "default",
-                "--tools", "Read,Glob,Grep,Bash,Edit,Write" if writable else "Read,Glob,Grep",
-                "--allowedTools", "Read,Glob,Grep,Bash,Edit,Write" if writable else "Read,Glob,Grep"]
+                "--tools", ",".join(tools), "--allowedTools", *allowed]
         if provider.config.model:
             argv += ["--model", provider.config.model]
         return argv

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 
@@ -33,21 +33,37 @@ class Config:
     startup_scan_messages: int = 50
     dedup_window_seconds: int = 86400
     max_jobs_per_hour: int = 10
+    # Changes here (or any file deletion) keep the PR for a human instead of auto-merging.
+    protected_paths: list[str] = field(default_factory=lambda: [
+        ".github/*", "CODEOWNERS", "*/CODEOWNERS", ".gitmodules", ".gitattributes", "*/.gitattributes"])
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str) -> Config:
         source = Path(path).resolve()
         data = json.loads(source.read_text(encoding="utf-8"))
-        data["providers"] = {k: ProviderConfig(**v) for k, v in data.get("providers", {}).items()}
+        if not isinstance(data, dict):
+            raise ValueError("配置文件必须为 JSON 对象")
+        unknown_keys(data, cls, "")
+        providers = data.get("providers", {})
+        if not isinstance(providers, dict) or not all(isinstance(v, dict) for v in providers.values()):
+            raise ValueError("providers 必须为对象")
+        for name, value in providers.items():
+            unknown_keys(value, ProviderConfig, f"providers.{name}.")
+        data["providers"] = {k: ProviderConfig(**v) for k, v in providers.items()}
+        for key in ("guild_id", "listen_channel_id", "report_channel_id", "repository"):
+            if key not in data:
+                raise ValueError(f"缺少配置项 {key}")
         data["state_dir"] = (source.parent / data.get("state_dir", ".repairbot")).resolve()
         for key in ("guild_id", "listen_channel_id", "report_channel_id"):
-            data[key] = int(data[key])
+            data[key] = discord_id(data[key], key)
         config = cls(**data)
         config.validate()
         return config
 
     def validate(self) -> None:
+        if not isinstance(self.repository, str):
+            raise ValueError("repository 必须为字符串")
         self.repository = normalize_repository(self.repository)
         for key in ("auto_merge", "require_ci"):
             if not isinstance(getattr(self, key), bool):
@@ -64,9 +80,9 @@ class Config:
             raise ValueError("allowed_author_ids 必须为数组")
         # Discord IDs are often copied as strings; compare them as integers.
         self.allowed_author_ids = [discord_id(v, "allowed_author_ids") for v in self.allowed_author_ids]
-        if self.auto_merge and not self.allowed_author_ids:
-            raise ValueError("auto_merge=true 时必须配置 allowed_author_ids，避免任何频道成员都能触发自动合并；"
-                             "或设 auto_merge=false 仅创建 PR")
+        if not self.allowed_author_ids:
+            # Incident text reaches AI sessions that edit code and run tests on this machine.
+            raise ValueError("必须配置 allowed_author_ids，避免任何频道成员都能让 AI 会话在本机执行代码")
         if self.listen_channel_id == self.report_channel_id:
             raise ValueError("监听频道和报告频道必须不同")
         if self.reviewers not in (1, 2):
@@ -81,10 +97,28 @@ class Config:
             raise ValueError("dedup_window_seconds 和 max_jobs_per_hour 不能为负数（0 表示关闭）")
         if not 0 <= self.startup_scan_messages <= 1000:
             raise ValueError("startup_scan_messages 必须为 0..1000")
-        re.compile(self.error_pattern)
+        if not isinstance(self.error_pattern, str):
+            raise ValueError("error_pattern 必须为字符串")
+        try:
+            re.compile(self.error_pattern)
+        except re.error as exc:
+            raise ValueError(f"error_pattern 不是有效正则：{exc}") from None
+        if not isinstance(self.protected_paths, list) or not all(isinstance(v, str) and v for v in self.protected_paths):
+            raise ValueError("protected_paths 必须为非空字符串数组")
+        if not isinstance(self.test_commands, list):
+            raise ValueError("test_commands 必须为数组")
+        for name, provider in self.providers.items():
+            if not isinstance(provider.quota_command, list):
+                raise ValueError(f"providers.{name}.quota_command 必须为数组")
         for argv in self.test_commands + [p.quota_command for p in self.providers.values() if p.quota_command]:
             if not isinstance(argv, list) or not argv or not all(isinstance(v, str) and v for v in argv):
                 raise ValueError("命令必须为非空字符串数组，不接受 shell 字符串")
+
+
+def unknown_keys(data: dict, cls, prefix: str) -> None:
+    extra = set(data) - {f.name for f in fields(cls)}
+    if extra:
+        raise ValueError("未知配置项：" + "、".join(prefix + k for k in sorted(extra)))
 
 
 def discord_id(value, name: str) -> int:

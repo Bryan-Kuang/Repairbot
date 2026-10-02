@@ -43,7 +43,8 @@ async def doctor(config: Config, store: Store) -> dict:
         pass
     scheduler = Scheduler(config, store, silent)
     await asyncio.gather(*(probe(p) for p in scheduler.providers))
-    await scheduler.refresh()
+    # Diagnostics only: do not change provider cooldowns used by the running service.
+    await scheduler.refresh(persist=False)
     github_logged_in = False
     if shutil.which("gh"):
         try:

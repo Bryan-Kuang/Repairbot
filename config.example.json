@@ -8,7 +8,7 @@
   "auto_merge": true,
   "require_ci": true,
   "test_commands": [],
-  "allowed_author_ids": [],
+  "allowed_author_ids": ["123456789012345681"],
   "error_pattern": "(?i)(error|exception|traceback|fatal|panic|报错|错误)",
   "session_timeout_seconds": 1800,
   "cooldown_seconds": 3600,
@@ -16,6 +16,7 @@
   "startup_scan_messages": 50,
   "dedup_window_seconds": 86400,
   "max_jobs_per_hour": 10,
+  "protected_paths": [".github/*", "CODEOWNERS", "*/CODEOWNERS", ".gitmodules", ".gitattributes", "*/.gitattributes"],
   "providers": {
     "codex": {"executable": null, "quota_command": [], "native_quota": true, "model": null},
     "claude": {"executable": null, "quota_command": [], "model": null}

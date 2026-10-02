@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 from repairbot.config import Config, ProviderConfig, normalize_repository
 from repairbot.codex_quota import normalize_usage, read_usage
-from repairbot.github import GitHub, PendingCI
+from repairbot.github import BranchBehind, GitHub, PendingCI, changed_path_risks
 from repairbot.process import Result, agent_environment, checked, run
 from repairbot.providers import (NoCapacity, Provider, ProviderFailure, Quota, Scheduler,
                                  discover, final_response, quota_exhausted)
@@ -23,6 +23,7 @@ from repairbot.workflow import Workflow
 
 
 def config(root: Path, **kwargs) -> Config:
+    kwargs.setdefault("allowed_author_ids", [4])
     return Config(1, 2, 3, "owner/repo", root, **kwargs)
 
 
@@ -91,10 +92,37 @@ class ParsingTests(unittest.TestCase):
                        {"reviewers": "2", "allowed_author_ids": [4]},
                        {"allowed_author_ids": ["abc"]},
                        {"allowed_author_ids": [True]},
-                       {"allowed_author_ids": []}):
+                       {"allowed_author_ids": []},
+                       {"allowed_author_ids": [], "auto_merge": False},
+                       {"error_pattern": "("},
+                       {"protected_paths": "x"}):
             with self.assertRaises(ValueError, msg=kwargs):
                 config(Path("/tmp"), **kwargs).validate()
         config(Path("/tmp"), auto_merge=False).validate()
+        with self.assertRaises(ValueError):
+            Config(1, 2, 3, 123, Path("/tmp"), allowed_author_ids=[4]).validate()
+
+    def test_config_file_errors_are_readable(self):
+        base = {"guild_id": 1, "listen_channel_id": 2, "report_channel_id": 3,
+                "repository": "owner/repo", "allowed_author_ids": [4]}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            for extra, message in (({"reviewer": 1}, "reviewer"), ({"providers": {"codex": {"exe": "x"}}}, "providers.codex.exe")):
+                path.write_text(json.dumps({**base, **extra}))
+                with self.assertRaisesRegex(ValueError, message):
+                    Config.load(str(path))
+            path.write_text(json.dumps({k: v for k, v in base.items() if k != "repository"}))
+            with self.assertRaisesRegex(ValueError, "repository"):
+                Config.load(str(path))
+            path.write_text(json.dumps(base))
+            self.assertEqual(Config.load(str(path)).repository, "owner/repo")
+
+    def test_protected_paths_and_deletions_are_flagged(self):
+        patterns = config(Path("/tmp")).protected_paths
+        diff = "M\tsrc/app.py\nA\ttests/test_app.py\nM\t.github/workflows/ci.yml\nD\ttests/test_old.py\nM\tdocs/CODEOWNERS"
+        self.assertEqual(changed_path_risks(diff, patterns),
+                         ["修改受保护路径 .github/workflows/ci.yml", "删除 tests/test_old.py", "修改受保护路径 docs/CODEOWNERS"])
+        self.assertEqual(changed_path_risks("M\tsrc/app.py", patterns), [])
 
     def test_environment_removes_coordinator_secrets(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"DISCORD_TOKEN": "secret", "GH_TOKEN": "github", "ANTHROPIC_API_KEY": "model-key"}):
@@ -264,6 +292,41 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
                 await self.scheduler.session("repair", "fix", self.root, self.root / "sessions")
         self.assertEqual(self.scheduler.ranked(set()), [])
 
+    async def test_exhausted_plus_failure_waits_instead_of_failing(self):
+        self.scheduler.refresh = AsyncMock()
+        replies = [Result(1, "usage limit reached"), Result(1, "crash")]
+        with patch("repairbot.providers.run", AsyncMock(side_effect=replies)):
+            with self.assertRaises(NoCapacity):
+                await self.scheduler.session("repair", "fix", self.root, self.root / "sessions")
+
+    async def test_quota_query_does_not_lift_cli_reported_limit(self):
+        self.store.block("claude", time.time() + 100)
+        self.scheduler.providers[1].config.quota_command = ["claude-quota"]
+        with patch("repairbot.providers.run", AsyncMock(return_value=Result(0, '{"remaining_fraction":0.5}'))):
+            await self.scheduler.refresh()
+        self.assertGreater(self.store.blocked_until("claude"), time.time())
+        with patch("repairbot.providers.run", AsyncMock(return_value=Result(0, '{"remaining_fraction":0}'))):
+            await self.scheduler.refresh(persist=False)
+        self.assertEqual(self.store.blocked_until("codex"), 0)
+        self.scheduler.providers[0].config.quota_command = ["codex-quota"]
+        with patch("repairbot.providers.run", AsyncMock(return_value=Result(0, '{"remaining_fraction":0}'))):
+            await self.scheduler.refresh()
+        self.assertGreater(self.store.blocked_until("codex"), time.time())
+        with patch("repairbot.providers.run", AsyncMock(return_value=Result(0, '{"remaining_fraction":0.4}'))):
+            await self.scheduler.refresh()
+        self.assertEqual(self.store.blocked_until("codex"), 0)
+
+    async def test_claude_repair_bash_limited_to_test_commands(self):
+        claude = self.scheduler.providers[1]
+        argv = self.scheduler.command(claude, "repair")
+        self.assertNotIn("Bash", ",".join(argv))
+        self.scheduler.config.test_commands = [["python3", "-m", "pytest", "-q"]]
+        argv = self.scheduler.command(claude, "repair")
+        allowed = argv[argv.index("--allowedTools") + 1:]
+        self.assertIn("Bash(python3 -m pytest -q:*)", allowed)
+        self.assertNotIn("Bash", allowed)
+        self.assertNotIn("Edit", self.scheduler.command(claude, "triage"))
+
     async def test_quota_hook_updates_order(self):
         for p in self.scheduler.providers:
             p.config.quota_command = [p.name, "quota"]
@@ -291,7 +354,7 @@ class MergeTests(unittest.IsolatedAsyncioTestCase):
     async def test_requires_successful_ci_and_unchanged_versions(self):
         for pr, exception in (
             (self.pr(headRefOid="new"), RuntimeError),
-            (self.pr(baseRefOid="new"), RuntimeError),
+            (self.pr(mergeStateStatus="BEHIND"), BranchBehind),
             (self.pr(statusCheckRollup=[]), PendingCI),
             (self.pr(statusCheckRollup=[{"status": "IN_PROGRESS"}]), PendingCI),
             (self.pr(statusCheckRollup=[{"status": "COMPLETED", "conclusion": "FAILURE"}]), RuntimeError),
@@ -303,14 +366,24 @@ class MergeTests(unittest.IsolatedAsyncioTestCase):
             github.pr = AsyncMock(return_value=pr)
             github.gh = AsyncMock()
             with self.assertRaises(exception):
-                await github.merge(1, "head", "base")
+                await github.merge(1, "head")
             github.gh.assert_not_awaited()
+
+    async def test_base_move_keeps_reviews_and_grace_waits_for_checks(self):
+        github = GitHub(config(Path("/tmp"), require_ci=False))
+        github.pr = AsyncMock(return_value=self.pr(statusCheckRollup=[]))
+        github.gh = AsyncMock()
+        with self.assertRaises(PendingCI):
+            await github.merge(1, "head", checks_grace=True)
+        github.pr = AsyncMock(side_effect=[self.pr(baseRefOid="moved", statusCheckRollup=[]), self.pr(state="MERGED")])
+        await github.merge(1, "head")
+        github.gh.assert_awaited()
 
     async def test_merge_uses_exact_head_guard(self):
         github = GitHub(config(Path("/tmp")))
         github.pr = AsyncMock(side_effect=[self.pr(), self.pr(state="MERGED")])
         github.gh = AsyncMock()
-        await github.merge(1, "head", "base")
+        await github.merge(1, "head")
         argv = github.gh.call_args.args
         self.assertIn("--match-head-commit", argv)
         self.assertEqual(argv[-1], "head")
@@ -322,6 +395,11 @@ class FakeGitHub:
         self.merges = 0
         self.publishes = 0
         self.tests_run = 0
+        self.events = []
+        self.risks = []
+        self.head_sha = "fixed"
+        self.base_sha = "base"
+        self.behind = 0
 
     async def prepare(self, root, branch):
         repo = root / "repo"
@@ -332,7 +410,7 @@ class FakeGitHub:
         return True
 
     async def head(self, repo):
-        return "fixed" if repo.name.startswith("review-") else "initial"
+        return self.head_sha if repo.name.startswith("review-") else "initial"
 
     async def gh(self, *args):
         return "[]"
@@ -341,7 +419,17 @@ class FakeGitHub:
         return ""
 
     async def tests(self, *args):
+        self.events.append("tests")
         self.tests_run += 1
+
+    async def commit(self, *args):
+        self.events.append("commit")
+
+    async def discard(self, *args):
+        self.events.append("discard")
+
+    async def risky_changes(self, *args):
+        return list(self.risks)
 
     async def publish(self, *args):
         self.publishes += 1
@@ -349,9 +437,13 @@ class FakeGitHub:
 
     async def pr(self, *args):
         return {"number": 1, "url": "https://github.com/owner/repo/pull/1", "state": "OPEN",
-                "headRefOid": "fixed", "baseRefOid": "base"}
+                "headRefOid": self.head_sha, "baseRefOid": self.base_sha}
 
     async def assert_version(self, *args):
+        return await self.pr(1)
+
+    async def update_branch(self, *args):
+        self.head_sha, self.base_sha = "updated", "base2"
         return await self.pr(1)
 
     async def review_copy(self, repo, target, sha):
@@ -359,7 +451,10 @@ class FakeGitHub:
         (target / ".git").mkdir(exist_ok=True)
         return target
 
-    async def merge(self, *args):
+    async def merge(self, *args, **kwargs):
+        if self.behind:
+            self.behind -= 1
+            raise BranchBehind("落后")
         self.merges += 1
 
 
@@ -399,6 +494,42 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         calls = self.scheduler.session.call_args_list
         self.assertEqual([c.args[0] for c in calls], ["triage", "repair", "review-1", "review-2"])
         self.assertNotEqual(calls[2].args[2], calls[3].args[2])
+        self.assertEqual([c.kwargs["avoid"] for c in calls[2:]], ["claude", "claude"])
+        self.assertEqual(self.workflow.github.events, ["commit", "tests", "discard"])
+
+    async def test_protected_changes_are_not_auto_merged(self):
+        self.workflow.github.risks = ["修改受保护路径 .github/workflows/ci.yml"]
+        self.scheduler.session.side_effect = self.responses()
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()["status"], "done")
+        self.assertEqual(self.workflow.github.merges, 0)
+        self.assertIn(".github", self.report.call_args.args[0])
+
+    async def test_behind_branch_is_updated_and_reviewed_again(self):
+        self.workflow.github.behind = 1
+        self.scheduler.session.side_effect = self.responses() + self.responses()[2:]
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()["phase"], "review")
+        self.assertEqual(self.row()["status"], "queued")
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()["status"], "done")
+        self.assertEqual(self.workflow.github.merges, 1)
+        data = json.loads(self.row()["data"])
+        self.assertEqual((data["sha"], data["base_sha"], data["branch_updates"]), ("updated", "base2", 1))
+        self.assertTrue(all(r["sha"] == "updated" for r in data["reviews"]))
+
+    async def test_base_move_during_review_keeps_reviews(self):
+        self.scheduler.session.side_effect = self.responses()
+        original = self.scheduler.session.side_effect
+
+        async def session(*args, **kwargs):
+            if args[0] == "review-1":
+                self.workflow.github.base_sha = "moved"
+            return next(original)
+        self.scheduler.session.side_effect = session
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()["status"], "done")
+        self.assertEqual(json.loads(self.row()["data"])["base_sha"], "moved")
 
     async def test_rejected_review_keeps_pr_and_never_merges(self):
         self.scheduler.session.side_effect = self.responses(False)
@@ -494,6 +625,60 @@ for line in sys.stdin:
             (target / "app.py").write_text("changed")
             self.assertEqual((repo / "app.py").read_text(), "before")
             self.assertFalse(await github.clean(target))
+
+    async def test_planted_git_config_and_hooks_do_not_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            await checked(["git", "init", "-b", "main"], cwd=repo)
+            await checked(["git", "config", "user.name", "Test"], cwd=repo)
+            await checked(["git", "config", "user.email", "test@example.com"], cwd=repo)
+            github = GitHub(config(root))
+            await github.trust(repo)
+            marker = root / "pwned"
+            hook = repo / ".git" / "hooks" / "pre-commit"
+            hook.write_text(f"#!/bin/sh\necho \"$DISCORD_TOKEN\" > {marker}\n")
+            hook.chmod(0o700)
+            with (repo / ".git" / "config").open("a") as handle:
+                handle.write(f"[core]\n\tfsmonitor = \"echo $DISCORD_TOKEN > {marker}; false\"\n")
+            (repo / "app.py").write_text("fix")
+            with patch.dict(os.environ, {"DISCORD_TOKEN": "secret"}):
+                self.assertFalse(await github.clean(repo))
+                await github.commit(repo, "fix")
+            self.assertFalse(marker.exists())
+            self.assertNotIn("fsmonitor", (repo / ".git" / "config").read_text())
+            self.assertTrue(await github.clean(repo))
+
+    async def test_child_processes_do_not_receive_discord_token(self):
+        with patch.dict(os.environ, {"DISCORD_TOKEN": "secret"}):
+            result = await run([sys.executable, "-c", "import os; print(os.environ.get('DISCORD_TOKEN'))"])
+        self.assertEqual(result.output.strip(), "None")
+
+    async def test_discard_removes_test_artifacts_but_keeps_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            await checked(["git", "init", "-b", "main"], cwd=repo)
+            await checked(["git", "config", "user.name", "Test"], cwd=repo)
+            await checked(["git", "config", "user.email", "test@example.com"], cwd=repo)
+            github = GitHub(config(root))
+            (repo / "app.py").write_text("fix")
+            (repo / "pkg" / "__pycache__").mkdir(parents=True)
+            (repo / "pkg" / "__pycache__" / "app.cpython-311.pyc").write_text("cache")
+            (repo / ".pytest_cache").mkdir()
+            (repo / ".pytest_cache" / "README.md").write_text("cache")
+            await github.commit(repo, "fix")
+            committed = await github.git(repo, "show", "--name-only", "--format=", "HEAD")
+            self.assertEqual(committed.split(), ["app.py"])
+            await github.commit(repo, "nothing staged")
+            (repo / ".coverage").write_text("junk")
+            (repo / "app.py").write_text("modified by test")
+            await github.discard(repo)
+            self.assertFalse((repo / ".coverage").exists())
+            self.assertFalse((repo / ".pytest_cache").exists())
+            self.assertEqual((repo / "app.py").read_text(), "fix")
 
 
 if __name__ == "__main__":

@@ -111,13 +111,19 @@ repairbot run --config config.json
 
 `allowed_author_ids` 限定可信的用户、日志 Bot 或 webhook 作者 ID，可写数字或数字字符串。`auto_merge=true` 时必须非空，否则启动报错，避免任何频道成员都能触发自动合并；空数组仅在 `auto_merge=false` 时允许，此时接受频道里所有作者。`auto_merge`、`require_ci` 必须为 JSON 布尔值，不接受字符串 `"false"`。默认 `error_pattern` 匹配 error / exception / traceback / fatal / panic / 报错 / 错误；若日志格式不同，可更改正则或使用 `(?s).+` 处理所有非空文本。会读取消息文本和 embed 标题、描述、字段；不下载附件，也不执行报错消息中的指令。单条报错最多读取 `max_message_chars` 个字符，默认 24000。
 
+**去重与限流**：同一错误反复出现时不会重复消耗额度或重复开 PR。
+
+- 每条报错去掉时间戳、数字、UUID、十六进制地址后计算指纹。若相同指纹的任务仍在进行，或在 `dedup_window_seconds`（默认 86400，即 24 小时）内结束过，新消息记为 `duplicate` 并指向原任务，不再分诊。`0` 关闭去重。
+- `max_jobs_per_hour`（默认 10）限制每小时新开始分诊的报错数，超出的排队等待，不会丢弃；已在进行中的任务不受影响。`0` 表示不限。
+- 原任务失败时，窗口内的重复报错同样被抑制；修好环境后对原任务执行 `retry`。确需单独处理某条重复报错时，可对它执行 `retry`。
+
 ```bash
 repairbot jobs --config config.json
 repairbot retry 123456789012345678 --config config.json
 python3 -m unittest discover -s tests -v
 ```
 
-`retry` 只重新排队 `failed` / `waiting` 任务，保留已完成阶段，并重新开始 24 小时 CI 等待计时。CI 暂时失败、工具恢复或测试环境修复后可重试。若已人工改变 PR 提交，原 SHA 的审查不再有效；请人工处理该 PR，或发新报错启动新任务，不要修改数据库绕过版本检查。
+`retry` 只重新排队 `failed` / `waiting` / `duplicate` 任务，保留已完成阶段，并重新开始 24 小时 CI 等待计时。CI 暂时失败、工具恢复或测试环境修复后可重试。若已人工改变 PR 提交，原 SHA 的审查不再有效；请人工处理该 PR，或发新报错启动新任务，不要修改数据库绕过版本检查。
 
 任务目录包含修复克隆、各审查克隆、会话日志、测试日志和进度文件；`state.sqlite3` 保存任务阶段与额度冷却，`service.log` 保存服务日志。默认不自动清理，避免误删未完成工作；长期运行时按需归档已结束任务。Discord 报告发送失败会短暂重试并保留本地日志，不会因此撤销已完成的合并。
 

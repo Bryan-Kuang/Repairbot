@@ -21,27 +21,54 @@ class Store:
         CREATE TABLE IF NOT EXISTS providers (name TEXT PRIMARY KEY, blocked_until REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}
+        if "fingerprint" not in columns:
+            self.db.execute("ALTER TABLE jobs ADD COLUMN fingerprint TEXT")
+        if "started" not in columns:
+            self.db.execute("ALTER TABLE jobs ADD COLUMN started REAL NOT NULL DEFAULT 0")
+        self.db.execute("CREATE INDEX IF NOT EXISTS jobs_fingerprint ON jobs(fingerprint)")
         self.db.commit()
 
-    def enqueue(self, job_id: str, content: str) -> bool:
+    def enqueue(self, job_id: str, content: str, fingerprint: str | None = None, dedup_window: float = 0) -> bool:
+        now = time.time()
+        original = None
+        if fingerprint and dedup_window:
+            # Same normalized error still in progress, or handled within the window: record it, do not run again.
+            original = self.db.execute(
+                "SELECT id FROM jobs WHERE fingerprint=? AND id!=? AND status!='duplicate' "
+                "AND (status IN ('queued','running','waiting') OR updated>=?) ORDER BY updated DESC LIMIT 1",
+                (fingerprint, job_id, now - dedup_window),
+            ).fetchone()
+        if original:
+            status, data = "duplicate", json.dumps({"duplicate_of": original[0]})
+        else:
+            status, data = "queued", "{}"
+        # Duplicates are stored too, so replayed history stays idempotent and `jobs` shows them.
         cur = self.db.execute(
-            "INSERT OR IGNORE INTO jobs(id,content,status,updated) VALUES(?,?,'queued',?)",
-            (job_id, content, time.time()),
+            "INSERT OR IGNORE INTO jobs(id,content,status,data,updated,fingerprint) VALUES(?,?,?,?,?,?)",
+            (job_id, content, status, data, now, fingerprint),
         )
         self.db.commit()
-        return bool(cur.rowcount)
+        return bool(cur.rowcount) and original is None
 
     def recover(self) -> None:
         self.db.execute("UPDATE jobs SET status='queued' WHERE status='running'")
         self.db.commit()
 
-    def next_job(self) -> dict | None:
+    def next_job(self, max_starts_per_hour: int = 0) -> dict | None:
+        now = time.time()
+        can_start = not max_starts_per_hour or self.db.execute(
+            "SELECT count(*) FROM jobs WHERE started>=?", (now - 3600,)).fetchone()[0] < max_starts_per_hour
+        # Throttle only brand-new incidents; jobs already in progress always continue.
         row = self.db.execute(
-            "SELECT * FROM jobs WHERE status IN ('queued','waiting') AND retry_at<=? ORDER BY updated LIMIT 1",
-            (time.time(),),
+            "SELECT * FROM jobs WHERE status IN ('queued','waiting') AND retry_at<=? "
+            "AND (started>0 OR phase!='triage' OR ?) ORDER BY updated LIMIT 1",
+            (now, can_start),
         ).fetchone()
         if row is None:
             return None
+        if not row["started"]:
+            self.db.execute("UPDATE jobs SET started=? WHERE id=?", (now, row["id"]))
         self.save(row["id"], status="running")
         job = dict(row)
         job["data"] = json.loads(job["data"])
@@ -75,8 +102,10 @@ class Store:
         # A manual retry starts a fresh CI wait window and re-announces progress.
         data.pop("ci_wait_since", None)
         data.pop("ci_notified", None)
+        # Retrying a duplicate forces it to be handled as its own incident.
+        data.pop("duplicate_of", None)
         cur = self.db.execute(
-            "UPDATE jobs SET status='queued',retry_at=0,updated=?,data=? WHERE id=? AND status IN ('failed','waiting')",
+            "UPDATE jobs SET status='queued',retry_at=0,updated=?,data=? WHERE id=? AND status IN ('failed','waiting','duplicate')",
             (time.time(), json.dumps(data, ensure_ascii=False), job_id),
         )
         self.db.commit()

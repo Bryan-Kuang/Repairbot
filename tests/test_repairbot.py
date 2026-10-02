@@ -17,7 +17,7 @@ from repairbot.github import GitHub, PendingCI
 from repairbot.process import Result, agent_environment, checked, run
 from repairbot.providers import (NoCapacity, Provider, ProviderFailure, Quota, Scheduler,
                                  discover, final_response, quota_exhausted)
-from repairbot.service import enqueue_message
+from repairbot.service import enqueue_message, fingerprint
 from repairbot.store import Store
 from repairbot.workflow import Workflow
 
@@ -133,6 +133,61 @@ class StoreTests(unittest.TestCase):
             store.set_cursor(2, 200)
             store.set_cursor(2, 100)
             self.assertEqual(store.cursor(2), "200")
+
+
+class DedupThrottleTests(unittest.TestCase):
+    def test_fingerprint_ignores_volatile_parts(self):
+        a = "2026-10-01 12:00:01 Error: request 4821 failed at 0x7ffd12ab id=3f2a1b4c-0000-4000-8000-123456789abc"
+        b = "2026-10-02 08:15:44 Error:  request 99 failed at 0x1 id=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        self.assertEqual(fingerprint(a), fingerprint(b))
+        self.assertNotEqual(fingerprint("KeyError: 'user'"), fingerprint("TypeError: 'user'"))
+
+    def test_duplicates_recorded_once_and_window_expires(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            self.assertTrue(store.enqueue("1", "Error A", "fp", 3600))
+            self.assertFalse(store.enqueue("2", "Error A", "fp", 3600))
+            self.assertFalse(store.enqueue("2", "Error A", "fp", 3600))  # replayed history
+            row = store.db.execute("SELECT status,data FROM jobs WHERE id='2'").fetchone()
+            self.assertEqual((row[0], json.loads(row[1])), ("duplicate", {"duplicate_of": "1"}))
+            self.assertTrue(store.enqueue("3", "Error B", "other", 3600))
+            # Finished long ago: outside the window, the same error is handled again.
+            store.save("1", status="done")
+            store.db.execute("UPDATE jobs SET updated=0 WHERE id='1'")
+            self.assertTrue(store.enqueue("4", "Error A", "fp", 3600))
+            # Window 0 disables dedup; retry forces a duplicate to run.
+            self.assertTrue(store.enqueue("5", "Error A", "fp", 0))
+            self.assertTrue(store.retry_failed("2"))
+            self.assertEqual(store.db.execute("SELECT status,data FROM jobs WHERE id='2'").fetchone()[:], ("queued", "{}"))
+
+    def test_hourly_throttle_holds_new_jobs_but_not_in_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            for job_id in ("1", "2", "3"):
+                store.enqueue(job_id, "Error " + job_id)
+            first = store.next_job(max_starts_per_hour=1)
+            self.assertEqual(first["id"], "1")
+            self.assertIsNone(store.next_job(max_starts_per_hour=1))
+            # A started job that went back to the queue (e.g. waiting on CI) still continues.
+            store.save("1", status="waiting", phase="merge")
+            self.assertEqual(store.next_job(max_starts_per_hour=1)["id"], "1")
+            store.db.execute("UPDATE jobs SET started=1 WHERE id='1'")
+            self.assertEqual(store.next_job(max_starts_per_hour=1)["id"], "2")
+            self.assertEqual(store.next_job()["id"], "3")
+
+    def test_migrates_existing_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            import sqlite3
+            db = sqlite3.connect(Path(tmp) / "state.sqlite3")
+            db.execute("CREATE TABLE jobs (id TEXT PRIMARY KEY, content TEXT NOT NULL, status TEXT NOT NULL, "
+                       "phase TEXT NOT NULL DEFAULT 'triage', data TEXT NOT NULL DEFAULT '{}', "
+                       "updated REAL NOT NULL, retry_at REAL NOT NULL DEFAULT 0)")
+            db.execute("INSERT INTO jobs(id,content,status,phase,updated) VALUES('9','Error','queued','repair',1)")
+            db.commit()
+            db.close()
+            store = Store(Path(tmp))
+            self.assertEqual(store.next_job(max_starts_per_hour=1)["id"], "9")
+            self.assertTrue(store.enqueue("10", "Error", "fp", 3600))
 
 
 class DiscordRoutingTests(unittest.TestCase):

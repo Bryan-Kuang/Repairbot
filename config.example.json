@@ -14,6 +14,8 @@
   "cooldown_seconds": 3600,
   "max_message_chars": 24000,
   "startup_scan_messages": 50,
+  "dedup_window_seconds": 86400,
+  "max_jobs_per_hour": 10,
   "protected_paths": [".github/*", "CODEOWNERS", "*/CODEOWNERS", ".gitmodules", ".gitattributes", "*/.gitattributes"],
   "providers": {
     "codex": {"executable": null, "quota_command": [], "native_quota": true, "model": null},

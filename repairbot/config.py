@@ -31,6 +31,8 @@ class Config:
     cooldown_seconds: int = 3600
     max_message_chars: int = 24000
     startup_scan_messages: int = 50
+    dedup_window_seconds: int = 86400
+    max_jobs_per_hour: int = 10
     # Changes here (or any file deletion) keep the PR for a human instead of auto-merging.
     protected_paths: list[str] = field(default_factory=lambda: [
         ".github/*", "CODEOWNERS", "*/CODEOWNERS", ".gitmodules", ".gitattributes", "*/.gitattributes"])
@@ -66,7 +68,8 @@ class Config:
         for key in ("auto_merge", "require_ci"):
             if not isinstance(getattr(self, key), bool):
                 raise ValueError(f"{key} 必须为 true 或 false（不能是字符串）")
-        for key in ("reviewers", "session_timeout_seconds", "cooldown_seconds", "max_message_chars", "startup_scan_messages"):
+        for key in ("reviewers", "session_timeout_seconds", "cooldown_seconds", "max_message_chars", "startup_scan_messages",
+                    "dedup_window_seconds", "max_jobs_per_hour"):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, int):
                 raise ValueError(f"{key} 必须为整数")
@@ -90,6 +93,8 @@ class Config:
             raise ValueError("仅支持 codex 和 claude")
         if min(self.session_timeout_seconds, self.cooldown_seconds, self.max_message_chars) <= 0:
             raise ValueError("超时、冷却时间和消息长度必须为正数")
+        if min(self.dedup_window_seconds, self.max_jobs_per_hour) < 0:
+            raise ValueError("dedup_window_seconds 和 max_jobs_per_hour 不能为负数（0 表示关闭）")
         if not 0 <= self.startup_scan_messages <= 1000:
             raise ValueError("startup_scan_messages 必须为 0..1000")
         if not isinstance(self.error_pattern, str):

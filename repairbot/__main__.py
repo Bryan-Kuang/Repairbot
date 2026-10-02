@@ -75,13 +75,14 @@ def main() -> None:
         if args.command == "doctor":
             print(json.dumps(asyncio.run(doctor(config, store)), ensure_ascii=False, indent=2))
         elif args.command == "jobs":
-            rows = store.db.execute("SELECT id,status,phase,updated,retry_at FROM jobs ORDER BY updated DESC LIMIT 50").fetchall()
+            rows = store.db.execute("SELECT id,status,phase,updated,retry_at,json_extract(data,'$.duplicate_of') AS duplicate_of "
+                                   "FROM jobs ORDER BY updated DESC LIMIT 50").fetchall()
             print(json.dumps([dict(row) for row in rows], ensure_ascii=False, indent=2))
         elif args.command == "retry":
             if not args.job_id or not args.job_id.isdecimal():
                 parser.error("retry 需要 Discord 消息 ID")
             if not store.retry_failed(args.job_id):
-                raise RuntimeError("任务不存在，或不处于 failed/waiting 状态")
+                raise RuntimeError("任务不存在，或不处于 failed/waiting/duplicate 状态")
             print("任务已重新排队")
         else:
             if not shutil.which("git") or not shutil.which("gh"):

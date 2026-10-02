@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -23,6 +24,16 @@ def message_content(message) -> str:
     return "\n".join(p for p in parts if p)
 
 
+def fingerprint(text: str) -> str:
+    """Hash an error with volatile parts (IDs, timestamps, addresses, counters) removed."""
+    text = text.lower()
+    text = re.sub(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "<uuid>", text)
+    text = re.sub(r"0x[0-9a-f]+|\b[0-9a-f]{16,}\b", "<hex>", text)
+    text = re.sub(r"\d+", "<n>", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 def enqueue_message(config: Config, store: Store, message, bot_id: int) -> bool:
     if message.guild is None or message.guild.id != config.guild_id or message.channel.id != config.listen_channel_id:
         return False
@@ -33,7 +44,8 @@ def enqueue_message(config: Config, store: Store, message, bot_id: int) -> bool:
     text = message_content(message)
     if not re.search(config.error_pattern, text):
         return False
-    return store.enqueue(str(message.id), redact(text[:config.max_message_chars]))
+    content = redact(text[:config.max_message_chars])
+    return store.enqueue(str(message.id), content, fingerprint(content), config.dedup_window_seconds)
 
 
 async def serve(config: Config, store: Store) -> None:
@@ -78,7 +90,7 @@ async def serve(config: Config, store: Store) -> None:
     async def consume() -> None:
         store.recover()
         while True:
-            job = store.next_job()
+            job = store.next_job(config.max_jobs_per_hour)
             if job:
                 await workflow.execute(job)
             else:

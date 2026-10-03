@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from .config import Config
-from .github import BranchBehind, GitHub, PendingCI
+from .github import BranchBehind, GitHub, NeedsHumanApproval, PendingCI
 from .process import redact
 from .providers import NoCapacity, Scheduler
 from .store import Store
@@ -217,6 +217,12 @@ class Workflow:
                 await say(str(exc) + "；每分钟重查。PR：" + data["url"])
                 data["ci_notified"] = True
                 self.store.save(job_id, data=data)
+        except NeedsHumanApproval as exc:
+            # Kept as failed in the merge phase, so `retry` after a human approval resumes the merge.
+            data["needs_human"] = True
+            self.store.save(job_id, status="failed", data=data)
+            await say("AI 审查与 CI 已通过，但无法自动合并：" + redact(str(exc))
+                      + "。请人工审批并合并；人工批准后也可执行 retry 由 Repairbot 合并。PR：" + data["url"])
         except asyncio.CancelledError:
             self.store.save(job_id, status="queued", data=data)
             raise

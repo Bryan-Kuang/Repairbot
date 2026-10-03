@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 from repairbot.config import Config, ProviderConfig, normalize_repository
 from repairbot.codex_quota import normalize_usage, read_usage
-from repairbot.github import BranchBehind, GitHub, PendingCI, changed_path_risks
+from repairbot.github import BranchBehind, GitHub, NeedsHumanApproval, PendingCI, changed_path_risks
 from repairbot.process import Result, agent_environment, checked, run
 from repairbot.providers import (NoCapacity, Provider, ProviderFailure, Quota, Scheduler,
                                  discover, final_response, quota_exhausted)
@@ -361,6 +361,8 @@ class MergeTests(unittest.IsolatedAsyncioTestCase):
             (self.pr(statusCheckRollup=[{"status": "COMPLETED", "conclusion": "SKIPPED"}]), RuntimeError),
             (self.pr(statusCheckRollup=[{"__typename": "StatusContext", "state": "ERROR"}]), RuntimeError),
             (self.pr(mergeStateStatus="BLOCKED"), RuntimeError),
+            (self.pr(mergeStateStatus="BLOCKED", reviewDecision="REVIEW_REQUIRED"), NeedsHumanApproval),
+            (self.pr(reviewDecision="CHANGES_REQUESTED"), NeedsHumanApproval),
         ):
             github = GitHub(config(Path("/tmp")))
             github.pr = AsyncMock(return_value=pr)
@@ -378,6 +380,17 @@ class MergeTests(unittest.IsolatedAsyncioTestCase):
         github.pr = AsyncMock(side_effect=[self.pr(baseRefOid="moved", statusCheckRollup=[]), self.pr(state="MERGED")])
         await github.merge(1, "head")
         github.gh.assert_awaited()
+
+    async def test_merge_permission_denied_needs_human(self):
+        github = GitHub(config(Path("/tmp")))
+        github.pr = AsyncMock(return_value=self.pr())
+        github.gh = AsyncMock(side_effect=RuntimeError("gh exited 1: GraphQL: Resource not accessible by integration"))
+        with self.assertRaises(NeedsHumanApproval):
+            await github.merge(1, "head")
+        github.gh = AsyncMock(side_effect=RuntimeError("gh exited 1: network down"))
+        with self.assertRaises(RuntimeError) as caught:
+            await github.merge(1, "head")
+        self.assertNotIsInstance(caught.exception, NeedsHumanApproval)
 
     async def test_merge_uses_exact_head_guard(self):
         github = GitHub(config(Path("/tmp")))
@@ -400,6 +413,7 @@ class FakeGitHub:
         self.head_sha = "fixed"
         self.base_sha = "base"
         self.behind = 0
+        self.approval_required = False
 
     async def prepare(self, root, branch):
         repo = root / "repo"
@@ -452,6 +466,8 @@ class FakeGitHub:
         return target
 
     async def merge(self, *args, **kwargs):
+        if self.approval_required:
+            raise NeedsHumanApproval("仓库要求人工批准")
         if self.behind:
             self.behind -= 1
             raise BranchBehind("落后")
@@ -504,6 +520,21 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.row()["status"], "done")
         self.assertEqual(self.workflow.github.merges, 0)
         self.assertIn(".github", self.report.call_args.args[0])
+
+    async def test_required_human_approval_is_reported_and_retryable(self):
+        self.workflow.github.approval_required = True
+        self.scheduler.session.side_effect = self.responses()
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual((self.row()["status"], self.row()["phase"]), ("failed", "merge"))
+        self.assertTrue(json.loads(self.row()["data"])["needs_human"])
+        message = self.report.call_args.args[0]
+        self.assertIn("人工批准", message)
+        self.assertIn("https://github.com/owner/repo/pull/1", message)
+        self.workflow.github.approval_required = False
+        self.assertTrue(self.store.retry_failed("111"))
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()["status"], "done")
+        self.assertEqual(self.workflow.github.merges, 1)
 
     async def test_behind_branch_is_updated_and_reviewed_again(self):
         self.workflow.github.behind = 1

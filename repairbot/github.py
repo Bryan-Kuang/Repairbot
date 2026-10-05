@@ -162,6 +162,26 @@ class GitHub:
         return json.loads(await self.gh("pr", "view", str(number), "--repo", self.config.repository,
                                         "--json", "number,url,state,headRefOid,baseRefOid,baseRefName,mergeStateStatus,mergeable,isDraft,statusCheckRollup,reviewDecision"))
 
+    async def update_pr(self, repo: Path, branch: str, number: int, expected_sha: str, new_sha: str) -> dict:
+        await self.assert_origin(repo)
+        if (await self.git(repo, "branch", "--show-current")).strip() != branch:
+            raise RuntimeError("工作分支已改变，停止自动返修发布")
+        if await self.head(repo) != new_sha:
+            raise RuntimeError("本地提交已改变，停止自动返修发布")
+        pr = await self.pr(number)
+        if pr["state"] != "OPEN":
+            raise RuntimeError("返修 PR 已关闭或合并")
+        if pr["headRefOid"] == new_sha:
+            return pr  # Recover a push completed just before interruption.
+        if pr["headRefOid"] != expected_sha:
+            raise RuntimeError("PR 提交已改变，停止自动返修发布")
+        await self.git(repo, "merge-base", "--is-ancestor", expected_sha, new_sha)
+        # An exact lease detects concurrent writes between checking GitHub and pushing.
+        # The ancestor check above ensures our update is a fast-forward.
+        await self.git(repo, "push", f"--force-with-lease=refs/heads/{branch}:{expected_sha}",
+                       "origin", f"{new_sha}:refs/heads/{branch}")
+        return await self.assert_version(number, new_sha)
+
     async def review_copy(self, repo: Path, target: Path, sha: str) -> Path:
         if not target.exists():
             await checked(["git", *GIT_HARDENING, "clone", "--no-hardlinks", "--", str(repo), str(target)], timeout=180)

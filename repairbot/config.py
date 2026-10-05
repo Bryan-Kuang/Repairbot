@@ -22,7 +22,6 @@ class Config:
     repository: str
     state_dir: Path
     reviewers: int = 2
-    max_review_fix_rounds: int = 3
     auto_merge: bool = True
     require_ci: bool = True
     test_commands: list[list[str]] = field(default_factory=list)
@@ -45,6 +44,8 @@ class Config:
         data = json.loads(source.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError("配置文件必须为 JSON 对象")
+        # Older deployments may still have a round cap; revisions are now unlimited.
+        data.pop("max_review_fix_rounds", None)
         unknown_keys(data, cls, "")
         providers = data.get("providers", {})
         if not isinstance(providers, dict) or not all(isinstance(v, dict) for v in providers.values()):
@@ -69,7 +70,7 @@ class Config:
         for key in ("auto_merge", "require_ci"):
             if not isinstance(getattr(self, key), bool):
                 raise ValueError(f"{key} 必须为 true 或 false（不能是字符串）")
-        for key in ("reviewers", "max_review_fix_rounds", "session_timeout_seconds", "cooldown_seconds", "max_message_chars", "startup_scan_messages",
+        for key in ("reviewers", "session_timeout_seconds", "cooldown_seconds", "max_message_chars", "startup_scan_messages",
                     "dedup_window_seconds", "max_jobs_per_hour"):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, int):
@@ -88,8 +89,6 @@ class Config:
             raise ValueError("监听频道和报告频道必须不同")
         if self.reviewers not in (1, 2):
             raise ValueError("reviewers 必须为 1 或 2")
-        if self.max_review_fix_rounds < 0:
-            raise ValueError("max_review_fix_rounds 不能为负数（0 表示关闭自动返修）")
         if any(i <= 0 for i in (self.guild_id, self.listen_channel_id, self.report_channel_id)):
             raise ValueError("Discord ID 必须为正整数")
         if set(self.providers) - {"codex", "claude"}:

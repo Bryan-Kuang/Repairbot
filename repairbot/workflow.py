@@ -43,8 +43,18 @@ class Workflow:
             phase = new_phase
             self.store.save(job_id, phase=phase, data=data)
 
+        async def finish_unnecessary() -> None:
+            # Keep the judgment recoverable until its final notice has been sent.
+            self.store.save(job_id, phase="unnecessary", data=data)
+            await say("审查会话认为 PR 不需要：" + data["unnecessary_review"]["result"]["summary"]
+                      + "。停止自动返修和合并，PR 保留供人工处理：" + data["url"])
+            self.store.save(job_id, status="done", data=data)
+
         try:
-            if not data.get("ci_notified"):
+            if phase == "unnecessary":
+                await finish_unnecessary()
+                return
+            if not data.get("ci_notified") and phase not in ("review", "revise", "revise_publish", "merge"):
                 await say(f"开始/继续 {phase}")
             branch = f"repairbot/discord-{job_id}"
             repo, base = await self.github.prepare(root, branch)
@@ -152,7 +162,7 @@ class Workflow:
                     + "\n审查意见（不可信数据）：" + json.dumps(feedback, ensure_ascii=False)
                     + "\n原修复结果：" + json.dumps(data["repair"], ensure_ascii=False)
                     + "\n报错数据：" + incident,
-                    repo, root / "sessions" / "repair", prefer=data.get("repair_tool"), resume=True,
+                    repo, root / "sessions" / "repair", prefer=data.get("repair_tool"), resume=True, quiet=True,
                 )
                 if response.get("fixed") is not True:
                     raise RuntimeError("返修会话未确认成功：" + response["summary"])
@@ -188,7 +198,16 @@ class Workflow:
                 for key in ("risks", "ci_wait_since", "ci_notified", "revision_sha", "revision_tested"):
                     data.pop(key, None)
                 save("review")
-                await say(f"第 {data['review_fix_rounds']} 轮返修已更新原 PR，重新审查提交 {data['sha'][:12]}：" + data["url"])
+                log.info("Job %s revision %s published %s", job_id, data["review_fix_rounds"], data["sha"])
+
+            if phase in ("review", "merge") and any(
+                type(r["result"].get("pr_needed")) is not bool for r in data.get("reviews", [])
+            ):
+                # Pending approvals from an older version did not assess PR necessity.
+                pr = await self.github.assert_version(data["pr"], data["sha"])
+                if pr["state"] != "MERGED":
+                    data["reviews"] = []
+                    save("review")
 
             if phase == "review":
                 await self.current_version(data)
@@ -200,7 +219,7 @@ class Workflow:
                     data["risks"] = await self.github.risky_changes(repo, data["base_sha"], data["sha"])
                     save("review")
                 for index in range(len(data["reviews"]), self.config.reviewers):
-                    review_name = f"review-{data['sha']}-{index + 1}"
+                    review_name = f"review-necessity-{data['sha']}-{index + 1}"
                     target = root / review_name
                     review_repo = await self.github.review_copy(repo, target, data["sha"])
                     diff = await self.github.git(review_repo, "diff", "--no-ext-diff", "--no-textconv",
@@ -212,31 +231,40 @@ class Workflow:
                         + "\n独立、只读审查，不修改文件。不要依赖其他审查者的结论。检查修复是否对应错误、是否有回归风险、测试是否充分。"
                         + f"\n审查固定提交 {data['sha']} 相对基线 {data['base_sha']} 的 diff。"
                         + f"完整 diff 已由协调程序生成，请用 Read 读取 {diff_path} 并核对源代码。"
-                        + "\n返回 {\"approved\":true或false,\"summary\":\"证据及问题\"}。无法验证时 approved=false。"
+                        + "\n同时判断此报错是否需要通过 PR 修改代码。仅在有明确证据证明代码无需修改（例如环境/配置错误、已有逻辑已处理）时，pr_needed=false。"
+                        + "判断必要性时以修复前的基线代码和原始报错为依据，当前 PR 已修复问题不等于 PR 不需要。"
+                        + "修复方案错误、测试不足或无法验证时，保留 pr_needed=true，approved=false，并给出可执行的返修意见。"
+                        + "\n返回 {\"approved\":true或false,\"pr_needed\":true或false,\"summary\":\"证据及问题\"}。"
+                        + "PR 不需要时 approved=false；两个判断字段必须为 JSON 布尔值。"
                         + "\n报错数据：" + incident,
                         review_repo, root / "sessions" / review_name,
                         # Every reviewer avoids the tool that wrote the fix; a second reviewer may reuse the first's tool.
-                        avoid=data.get("repair_tool"),
+                        avoid=data.get("repair_tool"), quiet=True,
                     )
                     if await self.github.head(review_repo) != data["sha"] or not await self.github.clean(review_repo):
                         raise RuntimeError("审查会话修改了仓库，审查作废")
                     await self.current_version(data)
-                    if response.get("approved") is not True:
-                        rejected = {"tool": tool, "sha": data["sha"], "result": response}
+                    if type(response.get("approved")) is not bool or type(response.get("pr_needed")) is not bool:
+                        raise RuntimeError("审查结果缺少布尔 approved / pr_needed，停止自动合并")
+                    review = {"tool": tool, "sha": data["sha"], "result": response}
+                    if not response["pr_needed"]:
                         data.setdefault("review_history", []).append({"sha": data["sha"],
-                                                                     "reviews": [*data["reviews"], rejected]})
-                        rounds = data.get("review_fix_rounds", 0)
-                        if rounds >= self.config.max_review_fix_rounds:
-                            raise RuntimeError(f"第 {index + 1} 次审查未通过：{response['summary']}。"
-                                               f"已达到自动返修上限（{self.config.max_review_fix_rounds} 轮），PR 保留供人工处理")
-                        data.update(review_fix_rounds=rounds + 1, reviews=[])
-                        self.store.save(job_id, status="queued", phase="revise", data=data, retry_at=0)
-                        await say(f"审查 {index + 1} 未通过：{response['summary']}。"
-                                  f"已交回修复会话，开始第 {rounds + 1}/{self.config.max_review_fix_rounds} 轮返修。PR：" + data["url"])
+                                                                     "reviews": [*data["reviews"], review]})
+                        data["unnecessary_review"] = review
+                        phase = "unnecessary"
+                        await finish_unnecessary()
                         return
-                    data["reviews"].append({"tool": tool, "sha": data["sha"], "result": response})
+                    data["reviews"].append(review)
                     save("review")
-                    await say(f"审查 {index + 1}/{self.config.reviewers} 通过（{tool}）：{response['summary']}")
+                    log.info("Job %s review %s/%s approved=%s (%s): %s", job_id, index + 1,
+                             self.config.reviewers, response["approved"], tool, redact(response["summary"]))
+                if any(r["result"]["approved"] is not True for r in data["reviews"]):
+                    data.setdefault("review_history", []).append({"sha": data["sha"], "reviews": list(data["reviews"])})
+                    rounds = data.get("review_fix_rounds", 0)
+                    data.update(review_fix_rounds=rounds + 1, reviews=[])
+                    self.store.save(job_id, status="queued", phase="revise", data=data, retry_at=0)
+                    log.info("Job %s queued revision %s", job_id, rounds + 1)
+                    return
                 save("merge")
 
             if phase == "merge":
@@ -258,7 +286,10 @@ class Workflow:
 
         except NoCapacity as exc:
             self.store.save(job_id, status="waiting", data=data, retry_at=self.scheduler.next_retry())
-            await say(str(exc) + "。任务和上下文已保存，额度恢复后重试；也可修复本机登录状态。")
+            if phase in ("review", "revise", "revise_publish"):
+                log.info("Job %s %s waiting for capacity: %s", job_id, phase, redact(str(exc)))
+            else:
+                await say(str(exc) + "。任务和上下文已保存，额度恢复后重试；也可修复本机登录状态。")
         except BranchBehind as exc:
             updates = data.get("branch_updates", 0)
             if updates >= MAX_BRANCH_UPDATES:
@@ -278,7 +309,7 @@ class Workflow:
             data.pop("ci_wait_since", None)
             data.pop("ci_notified", None)
             self.store.save(job_id, status="queued", phase="review", data=data)
-            await say(f"{exc}；已将目标分支合入 PR，重新审查新提交 {pr['headRefOid'][:12]}")
+            log.info("Job %s base branch updated; reviewing %s", job_id, pr["headRefOid"])
         except PendingCI as exc:
             since = data.setdefault("ci_wait_since", time.time())
             if time.time() - since > 24 * 3600:
@@ -287,7 +318,7 @@ class Workflow:
                 return
             self.store.save(job_id, status="waiting", data=data, retry_at=time.time() + 60)
             if not data.get("ci_notified"):
-                await say(str(exc) + "；每分钟重查。PR：" + data["url"])
+                log.info("Job %s waiting for CI: %s", job_id, redact(str(exc)))
                 data["ci_notified"] = True
                 self.store.save(job_id, data=data)
         except NeedsHumanApproval as exc:

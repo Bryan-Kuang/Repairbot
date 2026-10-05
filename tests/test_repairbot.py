@@ -84,13 +84,14 @@ class ParsingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             c.validate()
 
-    def test_review_fix_limit_config(self):
-        self.assertEqual(config(Path('/tmp')).max_review_fix_rounds, 3)
-        for value in (0, 5):
-            config(Path('/tmp'), max_review_fix_rounds=value).validate()
-        for value in (-1, True, '3', 1.5):
-            with self.assertRaises(ValueError):
-                config(Path('/tmp'), max_review_fix_rounds=value).validate()
+    def test_legacy_review_fix_limit_is_ignored_when_loading_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.json'
+            path.write_text(json.dumps({'guild_id': 1, 'listen_channel_id': 2, 'report_channel_id': 3,
+                                        'repository': 'owner/repo', 'allowed_author_ids': [4],
+                                        'max_review_fix_rounds': 0}))
+            c = Config.load(str(path))
+            self.assertFalse(hasattr(c, 'max_review_fix_rounds'))
 
     def test_config_types_and_author_ids(self):
         c = config(Path("/tmp"), allowed_author_ids=["123456789012345678", 4])
@@ -272,6 +273,17 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.scheduler.ranked(set(), "claude")[0].name, "codex")
         self.store.block("claude", time.time() + 100)
         self.assertEqual(self.scheduler.ranked(set())[0].name, "codex")
+
+    async def test_quiet_sessions_suppress_progress_and_quota_switch_notifications(self):
+        self.scheduler.refresh = AsyncMock()
+        replies = [Result(1, 'usage limit reached'), Result(0, '{"fixed":true,"summary":"done"}')]
+        with patch('repairbot.providers.run', AsyncMock(side_effect=replies)):
+            response, tool = await self.scheduler.session('repair', 'fix', self.root,
+                                                         self.root / 'sessions', quiet=True)
+        self.assertTrue(response['fixed'])
+        self.assertEqual(tool, 'codex')
+        self.assertGreater(self.store.blocked_until('claude'), time.time())
+        self.report.assert_not_awaited()
 
     async def test_repair_resumes_original_session_after_scheduler_restart(self):
         session_id = '11111111-1111-4111-8111-111111111111'
@@ -625,8 +637,8 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
     def responses(self, approved=True):
         return [({"should_fix": True, "summary": "缺陷"}, "codex"),
                 ({"fixed": True, "summary": "已修复"}, "claude"),
-                ({"approved": approved, "summary": "审查"}, "codex"),
-                ({"approved": True, "summary": "审查"}, "claude")]
+                ({"approved": approved, "pr_needed": True, "summary": "审查"}, "codex"),
+                ({"approved": True, "pr_needed": True, "summary": "审查"}, "claude")]
 
     def row(self):
         return dict(self.store.db.execute("SELECT * FROM jobs WHERE id='111'").fetchone())
@@ -693,16 +705,86 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.row()["status"], "done")
         self.assertEqual(json.loads(self.row()["data"])["base_sha"], "moved")
 
-    async def test_rejected_review_keeps_pr_and_never_merges(self):
-        self.config.max_review_fix_rounds = 0
-        self.scheduler.session.side_effect = self.responses(False)
+    async def test_unnecessary_pr_stops_on_first_review_and_reports_reason(self):
+        self.scheduler.session.side_effect = self.responses()[:2] + [
+            ({'approved': False, 'pr_needed': False, 'summary': '报错来自外部服务配置，代码无需修改'}, 'codex')]
         await self.workflow.execute(self.store.next_job())
-        self.assertEqual(self.row()["status"], "failed")
+        self.assertEqual((self.row()['status'], self.row()['phase']), ('done', 'unnecessary'))
         self.assertEqual(self.workflow.github.publishes, 1)
         self.assertEqual(self.workflow.github.merges, 0)
+        self.assertEqual(self.scheduler.session.await_count, 3)
+        self.assertIn('PR 不需要', self.report.call_args.args[0])
+        self.assertIn('外部服务配置', self.report.call_args.args[0])
+        self.assertIn('/pull/1', self.report.call_args.args[0])
+        self.assertIsNone(self.store.next_job())
+        self.assertFalse(self.store.retry_failed('111'))
+
+    async def test_one_review_can_stop_unnecessary_pr_after_another_approved(self):
+        self.scheduler.session.side_effect = self.responses()[:3] + [
+            ({'approved': False, 'pr_needed': False, 'summary': '已有重试逻辑覆盖此错误'}, 'claude')]
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual((self.row()['status'], self.row()['phase']), ('done', 'unnecessary'))
+        data = json.loads(self.row()['data'])
+        self.assertEqual(len(data['review_history'][-1]['reviews']), 2)
+        self.assertFalse(data['unnecessary_review']['result']['pr_needed'])
+        self.assertEqual(self.workflow.github.merges, 0)
+
+    async def test_second_review_can_stop_unnecessary_pr_after_first_requests_revision(self):
+        self.scheduler.session.side_effect = self.responses(False)[:3] + [
+            ({'approved': False, 'pr_needed': False, 'summary': '原基线已正确处理这个错误'}, 'claude')]
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual((self.row()['status'], self.row()['phase']), ('done', 'unnecessary'))
+        self.assertEqual(self.scheduler.session.await_count, 4)
+        self.assertEqual(self.workflow.github.revisions, 0)
+        self.assertEqual(self.workflow.github.merges, 0)
+        self.assertIn('原基线已正确处理', self.report.call_args.args[0])
+
+    async def test_missing_or_invalid_pr_necessity_does_not_merge_or_revise(self):
+        for value in (None, 'false', 0):
+            with self.subTest(value=value):
+                self.store.save('111', status='queued', phase='triage', data={})
+                response = {'approved': True, 'summary': 'invalid'}
+                if value is not None:
+                    response['pr_needed'] = value
+                self.scheduler.session.side_effect = self.responses()[:2] + [(response, 'codex')]
+                await self.workflow.execute(self.store.next_job())
+                self.assertEqual(self.row()['status'], 'failed')
+                self.assertIn('pr_needed', self.report.call_args.args[0])
+                self.assertEqual(self.workflow.github.merges, 0)
+                self.assertEqual(self.workflow.github.revisions, 0)
+                self.workflow.github.local_sha = 'initial'
+
+    async def test_saved_legacy_reviews_reassess_pr_necessity_before_merging(self):
+        old_artifacts = self.root / 'jobs' / '111' / 'sessions' / 'review-fixed-1'
+        old_artifacts.mkdir(parents=True)
+        (old_artifacts / 'review-codex-1.jsonl').write_text('old approval without necessity assessment')
+        for phase in ('review', 'merge'):
+            with self.subTest(phase=phase):
+                legacy = {'tool': 'codex', 'sha': 'fixed', 'result': {'approved': True, 'summary': '旧审查'}}
+                self.store.save('111', status='queued', phase=phase,
+                                data={'pr': 1, 'url': 'https://github.com/owner/repo/pull/1',
+                                      'sha': 'fixed', 'base_sha': 'base', 'reviews': [legacy, legacy],
+                                      'risks': [], 'repair_tool': 'claude'})
+                self.scheduler.session.side_effect = [
+                    ({'approved': False, 'pr_needed': False, 'summary': '原报错不需要代码修改'}, 'codex')]
+                await self.workflow.execute(self.store.next_job())
+                self.assertEqual((self.row()['status'], self.row()['phase']), ('done', 'unnecessary'))
+                self.assertEqual(self.workflow.github.merges, 0)
+                self.assertNotEqual(self.scheduler.session.call_args.args[3], old_artifacts)
+
+    async def test_rejected_first_review_is_preserved_while_second_waits_for_quota(self):
+        self.scheduler.session.side_effect = self.responses(False)[:3] + [NoCapacity('额度耗尽')]
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual((self.row()['status'], self.row()['phase']), ('waiting', 'review'))
+        self.assertFalse(json.loads(self.row()['data'])['reviews'][0]['result']['approved'])
+        self.store.retry_failed('111')
+        self.scheduler.session.side_effect = [self.responses()[3]]
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual((self.row()['status'], self.row()['phase']), ('queued', 'revise'))
+        self.assertEqual(self.scheduler.session.await_count, 5)
 
     async def test_review_rejection_fixes_same_pr_and_restarts_all_reviews(self):
-        replies = self.responses()[:3] + [({'approved': False, 'summary': '缺少空值回归测试'}, 'codex')]
+        replies = self.responses()[:3] + [({'approved': False, 'pr_needed': True, 'summary': '缺少空值回归测试'}, 'codex')]
         self.scheduler.session.side_effect = replies
         await self.workflow.execute(self.store.next_job())
         self.assertEqual((self.row()['status'], self.row()['phase']), ('queued', 'revise'))
@@ -721,12 +803,12 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repair.args[0], 'repair')
         self.assertIn('缺少空值回归测试', repair.args[1])
         self.assertEqual(repair.args[3], calls[1].args[3])
-        self.assertEqual(repair.kwargs, {'prefer': 'claude', 'resume': True})
+        self.assertEqual(repair.kwargs, {'prefer': 'claude', 'resume': True, 'quiet': True})
         self.assertNotEqual(calls[2].args[3], calls[5].args[3])
         data = json.loads(self.row()['data'])
         self.assertTrue(all(r['sha'] == 'revised-1' for r in data['reviews']))
 
-    async def test_rejection_checkpoint_atomically_preserves_revise_phase_and_budget(self):
+    async def test_rejection_checkpoint_atomically_preserves_revise_phase_and_round_count(self):
         self.scheduler.session.side_effect = self.responses(False)
         save = self.store.save
         interrupted = False
@@ -749,20 +831,92 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.row()['status'], 'done')
         self.assertEqual(self.workflow.github.revisions, 1)
 
-    async def test_review_fix_limit_survives_manual_retry(self):
-        self.config.max_review_fix_rounds = 1
+    async def test_review_revisions_continue_beyond_old_limit_until_all_approve(self):
         self.scheduler.session.side_effect = self.responses(False)
         await self.workflow.execute(self.store.next_job())
-        self.scheduler.session.side_effect = [self.responses()[1], self.responses(False)[2]]
+        for index in range(5):
+            self.scheduler.session.side_effect = [self.responses()[1]] + self.responses(False)[2:]
+            await self.workflow.execute(self.store.next_job())
+            self.assertEqual((self.row()['status'], self.row()['phase']), ('queued', 'revise'))
+            self.assertEqual(json.loads(self.row()['data'])['review_fix_rounds'], index + 2)
+            # Reopening the coordinator's database must not impose a fresh round limit.
+            self.store.db.close()
+            self.store = Store(self.root)
+            self.workflow.store = self.store
+        self.scheduler.session.side_effect = [self.responses()[1]] + self.responses()[2:]
         await self.workflow.execute(self.store.next_job())
-        self.assertEqual(self.row()['status'], 'failed')
-        self.assertIn('上限', self.report.call_args.args[0])
-        self.store.retry_failed('111')
-        self.scheduler.session.side_effect = [self.responses(False)[2]]
+        self.assertEqual(self.row()['status'], 'done')
+        self.assertEqual(self.workflow.github.revisions, 6)
+        self.assertEqual(self.workflow.github.publishes, 1)
+        self.assertEqual(self.workflow.github.merges, 1)
+
+    async def test_revision_progress_is_silent_until_final_result(self):
+        self.scheduler.session.side_effect = self.responses(False)
         await self.workflow.execute(self.store.next_job())
-        self.assertEqual(self.row()['status'], 'failed')
-        self.assertEqual(self.workflow.github.revisions, 1)
+        self.report.reset_mock()
+        self.scheduler.session.side_effect = [self.responses()[1]] + self.responses(False)[2:]
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()['status'], 'queued')
+        self.report.assert_not_awaited()
+        for call in self.scheduler.session.call_args_list[2:]:
+            self.assertTrue(call.kwargs['quiet'])
+        self.scheduler.session.side_effect = [self.responses()[1]] + self.responses()[2:]
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()['status'], 'done')
+        self.report.assert_awaited_once()
+        self.assertIn('已合并', self.report.call_args.args[0])
+
+    async def test_revision_quota_wait_is_silent(self):
+        self.scheduler.session.side_effect = self.responses(False)
+        await self.workflow.execute(self.store.next_job())
+        self.report.reset_mock()
+        self.scheduler.session.side_effect = NoCapacity('额度耗尽')
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()['status'], 'waiting')
+        self.report.assert_not_awaited()
+
+    async def test_unnecessary_decision_survives_interruption_without_another_review(self):
+        self.scheduler.session.side_effect = self.responses()[:2] + [
+            ({'approved': False, 'pr_needed': False, 'summary': '无需修改'}, 'codex')]
+        def interrupt_report(message):
+            if 'PR 不需要' in message:
+                raise asyncio.CancelledError()
+
+        self.report.side_effect = interrupt_report
+        with self.assertRaises(asyncio.CancelledError):
+            await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()['phase'], 'unnecessary')
+        self.report.side_effect = None
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()['status'], 'done')
+        self.assertEqual(self.scheduler.session.await_count, 3)
         self.assertEqual(self.workflow.github.merges, 0)
+
+    async def test_unnecessary_final_report_is_retried_after_hard_crash(self):
+        class SimulatedCrash(BaseException):
+            pass
+
+        self.scheduler.session.side_effect = self.responses()[:2] + [
+            ({'approved': False, 'pr_needed': False, 'summary': '无需修改'}, 'codex')]
+
+        def crash_before_notice(message):
+            if 'PR 不需要' in message:
+                raise SimulatedCrash()
+
+        self.report.side_effect = crash_before_notice
+        with self.assertRaises(SimulatedCrash):
+            await self.workflow.execute(self.store.next_job())
+        self.store.recover()
+        resumed = self.store.next_job()
+        self.assertIsNotNone(resumed)
+        self.assertEqual(resumed['phase'], 'unnecessary')
+        self.report.side_effect = None
+        self.report.reset_mock()
+        await self.workflow.execute(resumed)
+        self.assertEqual(self.row()['status'], 'done')
+        self.assertEqual(self.scheduler.session.await_count, 3)
+        self.report.assert_awaited_once()
+        self.assertIn('PR 不需要', self.report.call_args.args[0])
 
     async def test_revision_quota_wait_retains_feedback_and_round_count(self):
         self.scheduler.session.side_effect = self.responses(False)
@@ -798,7 +952,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.workflow.github.head_sha = 'human-commit'
         await self.workflow.execute(self.store.next_job())
         self.assertEqual(self.row()['status'], 'failed')
-        self.assertEqual(self.scheduler.session.await_count, 3)
+        self.assertEqual(self.scheduler.session.await_count, 4)
         self.assertEqual(self.workflow.github.revisions, 0)
 
     async def test_revision_test_failure_does_not_push_and_retry_runs_tests_again(self):
@@ -856,7 +1010,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.scheduler.session.side_effect = self.responses()[2:]
         await self.workflow.execute(self.store.next_job())
         self.assertEqual(self.row()['status'], 'done')
-        self.assertEqual(self.scheduler.session.await_count, 6)
+        self.assertEqual(self.scheduler.session.await_count, 7)
         self.assertEqual(self.workflow.github.tests_run, 2)
 
     async def test_environment_error_does_not_create_pr(self):
@@ -945,7 +1099,7 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
                         return {'fixed': True, 'summary': 'guard added'}, 'codex'
                     diff = (cwd / '.git' / 'repairbot-review.patch').read_text()
                     approved = 'final fix' in diff
-                    return {'approved': approved, 'summary': 'ok' if approved else 'missing null guard'}, 'claude'
+                    return {'approved': approved, 'pr_needed': True, 'summary': 'ok' if approved else 'missing null guard'}, 'claude'
 
                 scheduler.session.side_effect = session
                 store.enqueue('111', 'TypeError: null')
@@ -966,7 +1120,7 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(data['reviews']), 2)
                 self.assertTrue(await github.clean(repo))
                 github.merge.assert_awaited_once()
-                self.assertEqual(scheduler.session.await_count, 4)
+                self.assertEqual(scheduler.session.await_count, 5)
             finally:
                 store.db.close()
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -15,6 +16,8 @@ from .config import Config, ProviderConfig
 from .codex_quota import normalize_usage, read_usage
 from .process import agent_environment, redact, run
 from .store import Store
+
+logger = logging.getLogger(__name__)
 
 
 class NoCapacity(RuntimeError):
@@ -214,7 +217,13 @@ class Scheduler:
 
     async def session(self, phase: str, prompt: str, cwd: Path, artifacts: Path,
                       *, avoid: str | None = None, prefer: str | None = None,
-                      resume: bool = False) -> tuple[dict, str]:
+                      resume: bool = False, quiet: bool = False) -> tuple[dict, str]:
+        async def announce(message: str) -> None:
+            if quiet:
+                logger.info("%s", redact(message))
+            else:
+                await self.report(message)
+
         artifacts.mkdir(parents=True, exist_ok=True, mode=0o700)
         metadata = artifacts / "session-ids.json"
         session_ids = json.loads(metadata.read_text()) if metadata.exists() else {}
@@ -229,7 +238,7 @@ class Scheduler:
             session_id = session_ids.get(provider.name) if resume and phase == "repair" and provider.name not in resume_failed else None
             if session_id:
                 session_id = str(uuid.UUID(session_id))
-            await self.report(f"{phase}：{'恢复' if session_id else '开启'} {provider.name} 会话")
+            await announce(f"{phase}：{'恢复' if session_id else '开启'} {provider.name} 会话")
             history = self.handoff(artifacts, cwd)
             complete_prompt = prompt + history
             stamp = time.time_ns()
@@ -242,14 +251,14 @@ class Scheduler:
             except (OSError, TimeoutError) as exc:
                 self.remember_session(provider.name, "", log, metadata, session_ids)
                 failures.append(f"{provider.name}: {type(exc).__name__}")
-                await self.report(f"{provider.name} 启动失败或超时，保留上下文并尝试另一工具")
+                await announce(f"{provider.name} 启动失败或超时，保留上下文并尝试另一工具")
                 continue
             self.remember_session(provider.name, result.output, log, metadata, session_ids)
             if quota_exhausted(result):
                 until = provider.quota.reset_at or time.time() + self.config.cooldown_seconds
                 self.store.block(provider.name, max(time.time() + 1, until))
                 exhausted = True
-                await self.report(f"{provider.name} 额度耗尽，保留输出及工作目录，切换工具")
+                await announce(f"{provider.name} 额度耗尽，保留输出及工作目录，切换工具")
                 continue
             if result.code:
                 if session_id and provider.name not in resume_failed:
@@ -260,10 +269,10 @@ class Scheduler:
                     temporary.write_text(json.dumps(session_ids), encoding="utf-8")
                     temporary.replace(metadata)
                     tried.remove(provider.name)
-                    await self.report(f"{provider.name} 原会话恢复失败，使用已保存上下文开启新修复会话")
+                    await announce(f"{provider.name} 原会话恢复失败，使用已保存上下文开启新修复会话")
                     continue
                 failures.append(f"{provider.name}: {redact(result.output[-1500:])}")
-                await self.report(f"{provider.name} 会话失败，尝试另一工具")
+                await announce(f"{provider.name} 会话失败，尝试另一工具")
                 continue
             try:
                 return final_response(result.output), provider.name

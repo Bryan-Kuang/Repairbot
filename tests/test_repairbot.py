@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import time
+import tracemalloc
 import unittest
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -82,6 +83,14 @@ class ParsingTests(unittest.TestCase):
         c.report_channel_id = c.listen_channel_id
         with self.assertRaises(ValueError):
             c.validate()
+
+    def test_review_fix_limit_config(self):
+        self.assertEqual(config(Path('/tmp')).max_review_fix_rounds, 3)
+        for value in (0, 5):
+            config(Path('/tmp'), max_review_fix_rounds=value).validate()
+        for value in (-1, True, '3', 1.5):
+            with self.assertRaises(ValueError):
+                config(Path('/tmp'), max_review_fix_rounds=value).validate()
 
     def test_config_types_and_author_ids(self):
         c = config(Path("/tmp"), allowed_author_ids=["123456789012345678", 4])
@@ -264,6 +273,87 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.store.block("claude", time.time() + 100)
         self.assertEqual(self.scheduler.ranked(set())[0].name, "codex")
 
+    async def test_repair_resumes_original_session_after_scheduler_restart(self):
+        session_id = '11111111-1111-4111-8111-111111111111'
+        for name in ('codex', 'claude'):
+            artifacts = self.root / name
+            self.scheduler.refresh = AsyncMock()
+            output = (json.dumps({'type': 'thread.started', 'thread_id': session_id}) + '\n'
+                      + '{"fixed":true,"summary":"done"}' if name == 'codex' else
+                      json.dumps({'type': 'result', 'session_id': session_id,
+                                  'result': '{"fixed":true,"summary":"done"}'}))
+            with patch('repairbot.providers.run', AsyncMock(return_value=Result(0, output))) as runner:
+                await self.scheduler.session('repair', 'fix', self.root, artifacts, prefer=name)
+                self.assertEqual(runner.call_args.args[0][0], name)
+            restarted = Scheduler(config(self.root), self.store, self.report)
+            restarted.providers = self.scheduler.providers
+            restarted.refresh = AsyncMock()
+            with patch('repairbot.providers.run', AsyncMock(return_value=Result(0, output))) as runner:
+                await restarted.session('repair', 'address review', self.root, artifacts,
+                                        prefer=name, resume=True)
+            argv = runner.call_args.args[0]
+            self.assertIn(session_id, argv)
+            self.assertIn('resume' if name == 'codex' else '--resume', argv)
+            self.assertIn('workspace-write' if name == 'codex' else 'acceptEdits', argv)
+
+    async def test_unavailable_original_tool_hands_feedback_to_other_tool(self):
+        self.scheduler.refresh = AsyncMock()
+        self.store.block('claude', time.time() + 60)
+        with patch('repairbot.providers.run', AsyncMock(return_value=Result(0, '{"fixed":true,"summary":"done"}'))) as runner:
+            await self.scheduler.session('repair', 'review: missing null guard', self.root,
+                                         self.root / 'sessions', prefer='claude', resume=True)
+        self.assertEqual(runner.call_args.args[0][0], 'codex')
+        self.assertIn('missing null guard', runner.call_args.kwargs['stdin'])
+
+    async def test_missing_native_session_falls_back_to_saved_context(self):
+        self.scheduler.refresh = AsyncMock()
+        artifacts = self.root / 'sessions'
+        artifacts.mkdir()
+        session_id = '11111111-1111-4111-8111-111111111111'
+        (artifacts / 'session-ids.json').write_text(json.dumps({'codex': session_id}))
+        (artifacts / 'repair-codex-1.jsonl').write_text('previous fix: guard empty input')
+        replies = [Result(1, 'No session found'), Result(0, '{"fixed":true,"summary":"done"}')]
+        with patch('repairbot.providers.run', AsyncMock(side_effect=replies)) as runner:
+            await self.scheduler.session('repair', 'address review', self.root, artifacts,
+                                         prefer='codex', resume=True)
+        first, second = runner.call_args_list
+        self.assertIn('resume', first.args[0])
+        self.assertNotIn('resume', second.args[0])
+        self.assertEqual(second.args[0][0], 'codex')
+        self.assertIn('guard empty input', second.kwargs['stdin'])
+
+    async def test_session_id_in_full_transcript_survives_output_tail_truncation(self):
+        self.scheduler.refresh = AsyncMock()
+        artifacts = self.root / 'sessions'
+        session_id = '11111111-1111-4111-8111-111111111111'
+
+        async def fake_run(argv, **kwargs):
+            output = '{"fixed":true,"summary":"done"}'
+            kwargs['transcript'].write_text(json.dumps({'type': 'thread.started', 'thread_id': session_id})
+                                           + '\n' + output)
+            return Result(0, output)
+
+        with patch('repairbot.providers.run', fake_run):
+            await self.scheduler.session('repair', 'fix', self.root, artifacts, prefer='codex')
+        self.assertEqual(json.loads((artifacts / 'session-ids.json').read_text())['codex'], session_id)
+
+    async def test_native_id_recovery_does_not_load_large_transcript_into_memory(self):
+        session_id = '11111111-1111-4111-8111-111111111111'
+        transcript, metadata = self.root / 'long.jsonl', self.root / 'session-ids.json'
+        with transcript.open('w') as handle:
+            handle.write(json.dumps({'type': 'thread.started', 'thread_id': session_id}) + '\n')
+            for _ in range(1024):
+                handle.write(json.dumps({'type': 'item.completed', 'text': 'x' * 8192}) + '\n')
+        ids = {}
+        tracemalloc.start()
+        try:
+            Scheduler.remember_session('codex', '{"fixed":true,"summary":"done"}', transcript, metadata, ids)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(ids['codex'], session_id)
+        self.assertLess(peak, 4_000_000)
+
     async def test_limit_switch_hands_off_partial_output_and_files(self):
         captured = []
 
@@ -351,6 +441,33 @@ class MergeTests(unittest.IsolatedAsyncioTestCase):
         result.update(kwargs)
         return result
 
+    async def test_update_same_pr_uses_lease_and_recovers_already_pushed_commit(self):
+        github = GitHub(config(Path('/tmp')))
+        github.assert_origin = AsyncMock()
+        github.head = AsyncMock(return_value='new')
+        github.git = AsyncMock(side_effect=['repairbot/discord-111', '', ''])
+        github.pr = AsyncMock(side_effect=[self.pr(), self.pr(headRefOid='new')])
+        await github.update_pr(Path('/tmp/repo'), 'repairbot/discord-111', 1, 'head', 'new')
+        push = github.git.call_args_list[-1].args
+        self.assertIn('--force-with-lease=refs/heads/repairbot/discord-111:head', push)
+        self.assertIn('new:refs/heads/repairbot/discord-111', push)
+        github.git.reset_mock(side_effect=True)
+        github.git.return_value = 'repairbot/discord-111'
+        github.pr = AsyncMock(return_value=self.pr(headRefOid='new'))
+        await github.update_pr(Path('/tmp/repo'), 'repairbot/discord-111', 1, 'head', 'new')
+        self.assertFalse(any('push' in call.args for call in github.git.call_args_list))
+
+    async def test_update_same_pr_rejects_external_commit_and_closed_pr(self):
+        github = GitHub(config(Path('/tmp')))
+        github.assert_origin = AsyncMock()
+        github.head = AsyncMock(return_value='new')
+        github.git = AsyncMock(return_value='repairbot/discord-111')
+        for pr in (self.pr(headRefOid='human'), self.pr(state='MERGED')):
+            github.pr = AsyncMock(return_value=pr)
+            with self.assertRaises(RuntimeError):
+                await github.update_pr(Path('/tmp/repo'), 'repairbot/discord-111', 1, 'head', 'new')
+        self.assertFalse(any('push' in call.args for call in github.git.call_args_list))
+
     async def test_requires_successful_ci_and_unchanged_versions(self):
         for pr, exception in (
             (self.pr(headRefOid="new"), RuntimeError),
@@ -414,6 +531,8 @@ class FakeGitHub:
         self.base_sha = "base"
         self.behind = 0
         self.approval_required = False
+        self.local_sha = 'initial'
+        self.revisions = 0
 
     async def prepare(self, root, branch):
         repo = root / "repo"
@@ -424,12 +543,14 @@ class FakeGitHub:
         return True
 
     async def head(self, repo):
-        return self.head_sha if repo.name.startswith("review-") else "initial"
+        return self.head_sha if repo.name.startswith("review-") else self.local_sha
 
     async def gh(self, *args):
         return "[]"
 
     async def git(self, *args):
+        if args[1:3] == ('reset', '--hard'):
+            self.local_sha = args[3]
         return ""
 
     async def tests(self, *args):
@@ -438,6 +559,7 @@ class FakeGitHub:
 
     async def commit(self, *args):
         self.events.append("commit")
+        self.local_sha = 'fixed' if self.local_sha == 'initial' else f'revised-{self.revisions + 1}'
 
     async def discard(self, *args):
         self.events.append("discard")
@@ -454,7 +576,16 @@ class FakeGitHub:
                 "headRefOid": self.head_sha, "baseRefOid": self.base_sha}
 
     async def assert_version(self, *args):
+        if args[1] != self.head_sha:
+            raise RuntimeError('PR 提交已改变')
         return await self.pr(1)
+
+    async def update_pr(self, repo, branch, number, expected_sha, new_sha):
+        if self.head_sha not in (expected_sha, new_sha):
+            raise RuntimeError('PR 提交已改变')
+        self.revisions += 1
+        self.head_sha = new_sha
+        return await self.pr(number)
 
     async def update_branch(self, *args):
         self.head_sha, self.base_sha = "updated", "base2"
@@ -563,11 +694,170 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(self.row()["data"])["base_sha"], "moved")
 
     async def test_rejected_review_keeps_pr_and_never_merges(self):
+        self.config.max_review_fix_rounds = 0
         self.scheduler.session.side_effect = self.responses(False)
         await self.workflow.execute(self.store.next_job())
         self.assertEqual(self.row()["status"], "failed")
         self.assertEqual(self.workflow.github.publishes, 1)
         self.assertEqual(self.workflow.github.merges, 0)
+
+    async def test_review_rejection_fixes_same_pr_and_restarts_all_reviews(self):
+        replies = self.responses()[:3] + [({'approved': False, 'summary': '缺少空值回归测试'}, 'codex')]
+        self.scheduler.session.side_effect = replies
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual((self.row()['status'], self.row()['phase']), ('queued', 'revise'))
+        rejected = json.loads(self.row()['data'])
+        self.assertEqual(rejected['review_fix_rounds'], 1)
+        self.assertFalse(rejected['review_history'][0]['reviews'][-1]['result']['approved'])
+        self.scheduler.session.side_effect = [self.responses()[1]] + self.responses()[2:]
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()['status'], 'done')
+        self.assertEqual(self.workflow.github.publishes, 1)
+        self.assertEqual(self.workflow.github.revisions, 1)
+        self.assertEqual(self.workflow.github.tests_run, 2)
+        self.assertEqual(self.workflow.github.merges, 1)
+        calls = self.scheduler.session.call_args_list
+        repair = calls[4]
+        self.assertEqual(repair.args[0], 'repair')
+        self.assertIn('缺少空值回归测试', repair.args[1])
+        self.assertEqual(repair.args[3], calls[1].args[3])
+        self.assertEqual(repair.kwargs, {'prefer': 'claude', 'resume': True})
+        self.assertNotEqual(calls[2].args[3], calls[5].args[3])
+        data = json.loads(self.row()['data'])
+        self.assertTrue(all(r['sha'] == 'revised-1' for r in data['reviews']))
+
+    async def test_rejection_checkpoint_atomically_preserves_revise_phase_and_budget(self):
+        self.scheduler.session.side_effect = self.responses(False)
+        save = self.store.save
+        interrupted = False
+
+        def interrupted_save(job_id, **values):
+            nonlocal interrupted
+            save(job_id, **values)
+            if values.get('data', {}).get('review_history') and not interrupted:
+                interrupted = True
+                raise asyncio.CancelledError()
+
+        self.store.save = interrupted_save
+        with self.assertRaises(asyncio.CancelledError):
+            await self.workflow.execute(self.store.next_job())
+        self.store.save = save
+        self.assertEqual((self.row()['status'], self.row()['phase']), ('queued', 'revise'))
+        self.assertEqual(json.loads(self.row()['data'])['review_fix_rounds'], 1)
+        self.scheduler.session.side_effect = [self.responses()[1]] + self.responses()[2:]
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()['status'], 'done')
+        self.assertEqual(self.workflow.github.revisions, 1)
+
+    async def test_review_fix_limit_survives_manual_retry(self):
+        self.config.max_review_fix_rounds = 1
+        self.scheduler.session.side_effect = self.responses(False)
+        await self.workflow.execute(self.store.next_job())
+        self.scheduler.session.side_effect = [self.responses()[1], self.responses(False)[2]]
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()['status'], 'failed')
+        self.assertIn('上限', self.report.call_args.args[0])
+        self.store.retry_failed('111')
+        self.scheduler.session.side_effect = [self.responses(False)[2]]
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()['status'], 'failed')
+        self.assertEqual(self.workflow.github.revisions, 1)
+        self.assertEqual(self.workflow.github.merges, 0)
+
+    async def test_revision_quota_wait_retains_feedback_and_round_count(self):
+        self.scheduler.session.side_effect = self.responses(False)
+        await self.workflow.execute(self.store.next_job())
+        self.scheduler.session.side_effect = NoCapacity('额度耗尽')
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual((self.row()['status'], self.row()['phase']), ('waiting', 'revise'))
+        self.store.retry_failed('111')
+        self.scheduler.session.side_effect = [self.responses()[1]] + self.responses()[2:]
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()['status'], 'done')
+        self.assertEqual(json.loads(self.row()['data'])['review_fix_rounds'], 1)
+
+    async def test_revision_publish_restart_does_not_repeat_ai_or_tests(self):
+        self.scheduler.session.side_effect = self.responses(False)
+        await self.workflow.execute(self.store.next_job())
+        original_update = self.workflow.github.update_pr
+        self.workflow.github.update_pr = AsyncMock(side_effect=RuntimeError('network failed'))
+        self.scheduler.session.side_effect = [self.responses()[1]]
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual((self.row()['status'], self.row()['phase']), ('failed', 'revise_publish'))
+        self.workflow.github.update_pr = original_update
+        self.store.retry_failed('111')
+        self.scheduler.session.side_effect = self.responses()[2:]
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()['status'], 'done')
+        self.assertEqual(self.workflow.github.tests_run, 2)
+        self.assertEqual(self.workflow.github.publishes, 1)
+
+    async def test_external_head_change_stops_revision_before_ai(self):
+        self.scheduler.session.side_effect = self.responses(False)
+        await self.workflow.execute(self.store.next_job())
+        self.workflow.github.head_sha = 'human-commit'
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()['status'], 'failed')
+        self.assertEqual(self.scheduler.session.await_count, 3)
+        self.assertEqual(self.workflow.github.revisions, 0)
+
+    async def test_revision_test_failure_does_not_push_and_retry_runs_tests_again(self):
+        self.scheduler.session.side_effect = self.responses(False)
+        await self.workflow.execute(self.store.next_job())
+        self.scheduler.session.side_effect = [self.responses()[1]]
+        original_tests = self.workflow.github.tests
+        self.workflow.github.tests = AsyncMock(side_effect=RuntimeError('tests failed'))
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual((self.row()['status'], self.row()['phase']), ('failed', 'revise_publish'))
+        self.assertEqual(self.workflow.github.revisions, 0)
+        self.workflow.github.tests = original_tests
+        self.store.retry_failed('111')
+        self.scheduler.session.side_effect = self.responses()[2:]
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()['status'], 'done')
+        self.assertEqual(self.workflow.github.tests_run, 2)
+
+    async def test_revision_without_changes_stops_instead_of_reviewing_old_commit(self):
+        self.scheduler.session.side_effect = self.responses(False)
+        await self.workflow.execute(self.store.next_job())
+        self.scheduler.session.side_effect = [self.responses()[1]]
+        self.workflow.github.commit = AsyncMock()
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()['status'], 'failed')
+        self.assertIn('未产生新的提交', self.report.call_args.args[0])
+        self.assertEqual(self.workflow.github.revisions, 0)
+        self.assertEqual(self.workflow.github.merges, 0)
+
+    async def test_revision_recomputes_protected_paths(self):
+        self.scheduler.session.side_effect = self.responses(False)
+        await self.workflow.execute(self.store.next_job())
+        self.workflow.github.risks = ['修改受保护路径 CODEOWNERS']
+        self.scheduler.session.side_effect = [self.responses()[1]] + self.responses()[2:]
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()['status'], 'done')
+        self.assertEqual(self.workflow.github.revisions, 1)
+        self.assertEqual(self.workflow.github.merges, 0)
+        self.assertIn('CODEOWNERS', self.report.call_args.args[0])
+
+    async def test_push_completed_before_crash_resumes_without_ai_or_tests(self):
+        self.scheduler.session.side_effect = self.responses(False)
+        await self.workflow.execute(self.store.next_job())
+        original_update = self.workflow.github.update_pr
+
+        async def interrupted_push(*args):
+            await original_update(*args)
+            raise asyncio.CancelledError()
+
+        self.workflow.github.update_pr = interrupted_push
+        self.scheduler.session.side_effect = [self.responses()[1]]
+        with self.assertRaises(asyncio.CancelledError):
+            await self.workflow.execute(self.store.next_job())
+        self.workflow.github.update_pr = original_update
+        self.scheduler.session.side_effect = self.responses()[2:]
+        await self.workflow.execute(self.store.next_job())
+        self.assertEqual(self.row()['status'], 'done')
+        self.assertEqual(self.scheduler.session.await_count, 6)
+        self.assertEqual(self.workflow.github.tests_run, 2)
 
     async def test_environment_error_does_not_create_pr(self):
         self.scheduler.session.return_value = ({"should_fix": False, "summary": "凭据无效"}, "codex")
@@ -608,6 +898,125 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_review_revision_pipeline_with_real_git_updates_same_branch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            job_root = root / 'jobs' / '111'
+            repo, remote = job_root / 'repo', root / 'remote.git'
+            repo.mkdir(parents=True)
+            await checked(['git', 'init', '--bare', str(remote)])
+            await checked(['git', 'init', '-b', 'main'], cwd=repo)
+            await checked(['git', 'config', 'user.name', 'Test'], cwd=repo)
+            await checked(['git', 'config', 'user.email', 'test@example.com'], cwd=repo)
+            await checked(['git', 'remote', 'add', 'origin', str(remote)], cwd=repo)
+            c = config(root, test_commands=[[sys.executable, '-c',
+                                             "from pathlib import Path; assert Path('app.py').read_text() == 'final fix'"]])
+            store = Store(root)
+            try:
+                github = GitHub(c)
+                await github.trust(repo)
+                (repo / 'app.py').write_text('base')
+                await github.commit(repo, 'base')
+                base = await github.head(repo)
+                await github.git(repo, 'push', 'origin', 'HEAD:refs/heads/main')
+                await github.git(repo, 'checkout', '-b', 'repairbot/discord-111')
+                (repo / 'app.py').write_text('first fix')
+                await github.commit(repo, 'first fix')
+                first = await github.head(repo)
+                await github.git(repo, 'push', 'origin', 'HEAD:refs/heads/repairbot/discord-111')
+
+                async def pr(number):
+                    head = (await checked(['git', '--git-dir', str(remote), 'rev-parse',
+                                           'refs/heads/repairbot/discord-111'])).strip()
+                    return {'number': 1, 'url': 'https://github.com/owner/repo/pull/1',
+                            'state': 'OPEN', 'headRefOid': head, 'baseRefOid': base}
+
+                github.pr = pr
+                github.prepare = AsyncMock(return_value=(repo, 'main'))
+                github.assert_origin = AsyncMock()
+                github.merge = AsyncMock()
+                scheduler = AsyncMock()
+
+                async def session(phase, prompt, cwd, artifacts, **kwargs):
+                    if phase == 'repair':
+                        self.assertIn('missing null guard', prompt)
+                        self.assertTrue(kwargs['resume'])
+                        (cwd / 'app.py').write_text('final fix')
+                        return {'fixed': True, 'summary': 'guard added'}, 'codex'
+                    diff = (cwd / '.git' / 'repairbot-review.patch').read_text()
+                    approved = 'final fix' in diff
+                    return {'approved': approved, 'summary': 'ok' if approved else 'missing null guard'}, 'claude'
+
+                scheduler.session.side_effect = session
+                store.enqueue('111', 'TypeError: null')
+                store.save('111', phase='review', data={'pr': 1, 'url': (await pr(1))['url'],
+                           'sha': first, 'base_sha': base, 'reviews': [], 'repair_tool': 'codex',
+                           'repair': {'fixed': True, 'summary': 'first fix'}})
+                workflow = Workflow(c, store, scheduler, AsyncMock())
+                workflow.github = github
+                await workflow.execute(store.next_job())
+                self.assertEqual(store.next_job()['phase'], 'revise')
+                store.recover()
+                await workflow.execute(store.next_job())
+                row = store.db.execute("SELECT status,data FROM jobs WHERE id='111'").fetchone()
+                self.assertEqual(row['status'], 'done')
+                data = json.loads(row['data'])
+                self.assertNotEqual(data['sha'], first)
+                self.assertEqual((await pr(1))['headRefOid'], data['sha'])
+                self.assertEqual(len(data['reviews']), 2)
+                self.assertTrue(await github.clean(repo))
+                github.merge.assert_awaited_once()
+                self.assertEqual(scheduler.session.await_count, 4)
+            finally:
+                store.db.close()
+
+    async def test_real_git_revision_push_preserves_concurrent_remote_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote, repo = root / 'remote.git', root / 'repo'
+            branch = 'repairbot/discord-111'
+            await checked(['git', 'init', '--bare', str(remote)])
+            repo.mkdir()
+            await checked(['git', 'init', '-b', branch], cwd=repo)
+            await checked(['git', 'config', 'user.name', 'Test'], cwd=repo)
+            await checked(['git', 'config', 'user.email', 'test@example.com'], cwd=repo)
+            await checked(['git', 'remote', 'add', 'origin', str(remote)], cwd=repo)
+            github = GitHub(config(root))
+            github.assert_origin = AsyncMock()  # This test uses a local bare remote.
+            (repo / 'app.py').write_text('initial')
+            await github.commit(repo, 'initial')
+            old_sha = await github.head(repo)
+            await github.git(repo, 'push', 'origin', f'HEAD:refs/heads/{branch}')
+            (repo / 'app.py').write_text('review fix')
+            await github.commit(repo, 'revision')
+            new_sha = await github.head(repo)
+
+            async def remote_head():
+                return (await checked(['git', '--git-dir', str(remote), 'rev-parse', f'refs/heads/{branch}'])).strip()
+
+            async def pr(number):
+                return {'state': 'OPEN', 'headRefOid': await remote_head(), 'baseRefOid': old_sha}
+
+            github.pr = pr
+            result = await github.update_pr(repo, branch, 1, old_sha, new_sha)
+            self.assertEqual(result['headRefOid'], new_sha)
+            await github.update_pr(repo, branch, 1, old_sha, new_sha)
+            # Create an alternative remote commit and emulate a write after the GitHub check.
+            human_sha = (await checked(['git', 'commit-tree', f'{old_sha}^{{tree}}', '-p', old_sha,
+                                        '-m', 'human change'], cwd=repo)).strip()
+            await github.git(repo, 'push', 'origin', f'{human_sha}:refs/heads/human')
+            await checked(['git', '--git-dir', str(remote), 'update-ref', f'refs/heads/{branch}', old_sha])
+
+            async def racing_pr(number):
+                snapshot = await pr(number)
+                await checked(['git', '--git-dir', str(remote), 'update-ref', f'refs/heads/{branch}', human_sha])
+                return snapshot
+
+            github.pr = racing_pr
+            with self.assertRaises(RuntimeError):
+                await github.update_pr(repo, branch, 1, old_sha, new_sha)
+            self.assertEqual(await remote_head(), human_sha)
+
     async def test_large_stdin_with_large_output_does_not_deadlock(self):
         script = "import sys; sys.stdout.write('x' * 300000); sys.stdout.flush(); print(len(sys.stdin.read()))"
         result = await run([sys.executable, "-c", script], stdin="y" * 300000, timeout=20)

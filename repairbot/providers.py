@@ -7,6 +7,7 @@ import re
 import shlex
 import shutil
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -212,29 +213,38 @@ class Scheduler:
         return min(times) if times else time.time() + self.config.cooldown_seconds
 
     async def session(self, phase: str, prompt: str, cwd: Path, artifacts: Path,
-                      *, avoid: str | None = None) -> tuple[dict, str]:
+                      *, avoid: str | None = None, prefer: str | None = None,
+                      resume: bool = False) -> tuple[dict, str]:
         artifacts.mkdir(parents=True, exist_ok=True, mode=0o700)
+        metadata = artifacts / "session-ids.json"
+        session_ids = json.loads(metadata.read_text()) if metadata.exists() else {}
         await self.refresh()
         tried: set[str] = set()
         failures: list[str] = []
         exhausted = False
+        resume_failed: set[str] = set()
         while options := self.ranked(tried, avoid):
-            provider = options[0]
+            provider = next((p for p in options if p.name == prefer), options[0])
             tried.add(provider.name)
-            await self.report(f"{phase}：开启 {provider.name} 会话")
+            session_id = session_ids.get(provider.name) if resume and phase == "repair" and provider.name not in resume_failed else None
+            if session_id:
+                session_id = str(uuid.UUID(session_id))
+            await self.report(f"{phase}：{'恢复' if session_id else '开启'} {provider.name} 会话")
             history = self.handoff(artifacts, cwd)
             complete_prompt = prompt + history
             stamp = time.time_ns()
             log = artifacts / f"{phase}-{provider.name}-{stamp}.jsonl"
             log.touch(mode=0o600)
-            argv = self.command(provider, phase)
+            argv = self.command(provider, phase, session_id=session_id)
             try:
                 result = await run(argv, cwd=cwd, env=agent_environment(self.config.state_dir),
                                    stdin=complete_prompt, timeout=self.config.session_timeout_seconds, transcript=log)
             except (OSError, TimeoutError) as exc:
+                self.remember_session(provider.name, "", log, metadata, session_ids)
                 failures.append(f"{provider.name}: {type(exc).__name__}")
                 await self.report(f"{provider.name} 启动失败或超时，保留上下文并尝试另一工具")
                 continue
+            self.remember_session(provider.name, result.output, log, metadata, session_ids)
             if quota_exhausted(result):
                 until = provider.quota.reset_at or time.time() + self.config.cooldown_seconds
                 self.store.block(provider.name, max(time.time() + 1, until))
@@ -242,6 +252,16 @@ class Scheduler:
                 await self.report(f"{provider.name} 额度耗尽，保留输出及工作目录，切换工具")
                 continue
             if result.code:
+                if session_id and provider.name not in resume_failed:
+                    # Missing/deleted sessions and old CLIs can still continue from our saved context.
+                    resume_failed.add(provider.name)
+                    session_ids.pop(provider.name, None)
+                    temporary = metadata.with_suffix(".tmp")
+                    temporary.write_text(json.dumps(session_ids), encoding="utf-8")
+                    temporary.replace(metadata)
+                    tried.remove(provider.name)
+                    await self.report(f"{provider.name} 原会话恢复失败，使用已保存上下文开启新修复会话")
+                    continue
                 failures.append(f"{provider.name}: {redact(result.output[-1500:])}")
                 await self.report(f"{provider.name} 会话失败，尝试另一工具")
                 continue
@@ -256,14 +276,14 @@ class Scheduler:
             raise NoCapacity("部分工具额度耗尽，其余工具失败（" + "；".join(f[:300] for f in failures) + "）")
         raise NoCapacity("所有已安装且可用的 AI 工具额度耗尽，或没有已登录的可用工具")
 
-    def command(self, provider: Provider, phase: str) -> list[str]:
+    def command(self, provider: Provider, phase: str, *, session_id: str | None = None) -> list[str]:
         writable = phase == "repair"
         if provider.name == "codex":
             argv = [provider.executable, "exec", "--json", "--sandbox", "workspace-write" if writable else "read-only",
                     "-c", 'approval_policy="never"']
             if provider.config.model:
                 argv += ["--model", provider.config.model]
-            return argv + ["-"]
+            return argv + (["resume", session_id, "-"] if session_id else ["-"])
         tools = ["Read", "Glob", "Grep"]
         allowed = list(tools)
         if writable:
@@ -277,7 +297,54 @@ class Scheduler:
                 "--tools", ",".join(tools), "--allowedTools", *allowed]
         if provider.config.model:
             argv += ["--model", provider.config.model]
+        if session_id:
+            argv += ["--resume", session_id]
         return argv
+
+    @staticmethod
+    def remember_session(name: str, output: str, transcript: Path, metadata: Path, ids: dict) -> None:
+        def extract(raw: str) -> str | None:
+            def objects():
+                try:
+                    yield json.loads(raw)
+                except ValueError:
+                    for line in raw.splitlines():
+                        try:
+                            yield json.loads(line)
+                        except ValueError:
+                            continue
+
+            for obj in objects():
+                if not isinstance(obj, dict):
+                    continue
+                value = (obj.get("thread_id") if name == "codex" and obj.get("type") == "thread.started"
+                         else obj.get("session_id") if name == "claude" and obj.get("type") in ("result", "system") else None)
+                if not isinstance(value, str):
+                    continue
+                try:
+                    return str(uuid.UUID(value))
+                except ValueError:
+                    continue
+            return None
+
+        session_id = extract(output)
+        if session_id is None and transcript.exists():
+            # Native ID events are small. Skip oversized records instead of reloading
+            # potentially unbounded command output from the full transcript.
+            with transcript.open(encoding="utf-8", errors="replace") as handle:
+                while line := handle.readline(65537):
+                    if len(line) > 65536:
+                        while line and not line.endswith("\n"):
+                            line = handle.readline(65537)
+                        continue
+                    session_id = extract(line)
+                    if session_id:
+                        break
+        if session_id:
+            ids[name] = session_id
+            temporary = metadata.with_suffix(".tmp")
+            temporary.write_text(json.dumps(ids), encoding="utf-8")
+            temporary.replace(metadata)
 
     @staticmethod
     def handoff(artifacts: Path, cwd: Path) -> str:

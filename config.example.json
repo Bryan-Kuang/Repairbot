@@ -5,6 +5,7 @@
   "repository": "https://github.com/YOUR_NAME/YOUR_REPO",
   "state_dir": ".repairbot",
   "reviewers": 2,
+  "max_review_fix_rounds": 3,
   "auto_merge": true,
   "require_ci": true,
   "test_commands": [],
